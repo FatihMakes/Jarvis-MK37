@@ -12,8 +12,8 @@
 #   auto         → (default) Intent auto-detected from context
 
 import subprocess
+import os
 import sys
-import json
 import re
 import time
 from pathlib import Path
@@ -25,15 +25,33 @@ def get_base_dir():
     return Path(__file__).resolve().parent.parent
 
 BASE_DIR           = get_base_dir()
-API_CONFIG_PATH    = BASE_DIR / "config" / "api_keys.json"
 DESKTOP            = Path.home() / "Desktop"
 MAX_BUILD_ATTEMPTS = 3
 GEMINI_MODEL       = "gemini-2.5-flash"
 
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    """Reads key from environment — loaded by dotenv in main.py at startup."""
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not set in environment.")
+    return key
+
+
+def _confirm(prompt: str, player=None) -> bool:
+    """
+    Asks the user for explicit approval before a destructive or executable action.
+    Uses Tkinter messagebox when the UI is running, terminal input as fallback.
+    """
+    if player and hasattr(player, "root"):
+        import tkinter.messagebox as mb
+        return mb.askyesno(
+            "JARVIS — Action Requires Approval",
+            prompt,
+            parent=player.root
+        )
+    answer = input(f"[JARVIS SANDBOX] {prompt} [Y/N]: ").strip().lower()
+    return answer in ("y", "yes")
 
 
 def _get_gemini(model: str = GEMINI_MODEL):
@@ -257,9 +275,17 @@ def _build(description, language, output_path, args, timeout, speak=None, player
 
     last_output = ""
     for attempt in range(1, MAX_BUILD_ATTEMPTS + 1):
-        print(f"[Code] 🔄 Attempt {attempt}/{MAX_BUILD_ATTEMPTS}")
+        print(f"[Code] Attempt {attempt}/{MAX_BUILD_ATTEMPTS}")
         if player:
             player.write_log(f"[Code] Attempt {attempt}...")
+
+        approved = _confirm(
+            f"JARVIS wants to execute the generated script (attempt {attempt}).\n"
+            f"File: {path}\n\nAllow?",
+            player
+        )
+        if not approved:
+            return "Action blocked by user."
 
         last_output = _run_file(path, args, timeout)
 
@@ -335,8 +361,15 @@ Updated code:"""
     except Exception as e:
         return f"Could not edit code: {e}"
 
+    approved = _confirm(
+        f"JARVIS wants to overwrite:\n  {file_path}\n\nAllow?",
+        player
+    )
+    if not approved:
+        return "Action blocked by user."
+
     status = _save_file(Path(file_path), edited)
-    print(f"[Code] ✅ Edited: {file_path}")
+    print(f"[Code] Edited: {file_path}")
     return f"File edited. {status}\n\nPreview:\n{_preview(edited)}"
 
 
@@ -374,6 +407,12 @@ def _run_action(file_path, args, timeout, player) -> str:
     p = Path(file_path)
     if not p.exists():
         return f"File not found: {file_path}"
+    approved = _confirm(
+        f"JARVIS wants to execute:\n  {file_path}\n\nAllow?",
+        player
+    )
+    if not approved:
+        return "Action blocked by user."
     if player:
         player.write_log(f"[Code] Running {p.name}...")
     return _run_file(p, args, timeout)

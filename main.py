@@ -1,10 +1,14 @@
 import asyncio
+import os
 import threading
 import json
 import re
 import sys
 import traceback
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import pyaudio
 from google import genai
@@ -38,7 +42,6 @@ def get_base_dir():
     return Path(__file__).resolve().parent
 
 BASE_DIR        = get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 FORMAT              = pyaudio.paInt16
@@ -50,11 +53,13 @@ CHUNK_SIZE          = 1024
 pya = pyaudio.PyAudio()
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-    
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "GEMINI_API_KEY not found. "
+            "Enter your key in the JARVIS setup dialog — it will be saved to .env."
+        )
+    return key
 
 def _load_system_prompt() -> str:
     try:

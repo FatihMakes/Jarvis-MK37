@@ -6,6 +6,22 @@ from pathlib import Path
 from datetime import datetime
 import send2trash
 
+
+def _confirm(prompt: str, player=None) -> bool:
+    """
+    Requires explicit user approval before a destructive file operation.
+    Falls back to terminal input when no UI player is available.
+    """
+    if player and hasattr(player, "root"):
+        import tkinter.messagebox as mb
+        return mb.askyesno(
+            "JARVIS — Action Requires Approval",
+            prompt,
+            parent=player.root
+        )
+    answer = input(f"[JARVIS SANDBOX] {prompt} [Y/N]: ").strip().lower()
+    return answer in ("y", "yes")
+
 def _get_desktop() -> Path:
     """Returns desktop path — works on Windows, Mac, Linux."""
     return Path.home() / "Desktop"
@@ -420,10 +436,22 @@ def file_controller(
 
         elif action == "delete":
             full = _full_path(path, name)
+            approved = _confirm(
+                f"JARVIS wants to delete:\n  {full}\n\nAllow?",
+                player
+            )
+            if not approved:
+                return "Action blocked by user."
             result = delete_file(full)
 
         elif action == "move":
             full = _full_path(path, name)
+            approved = _confirm(
+                f"JARVIS wants to move:\n  {full}\n  -> {parameters.get('destination', '?')}\n\nAllow?",
+                player
+            )
+            if not approved:
+                return "Action blocked by user."
             result = move_file(full, parameters.get("destination", ""))
 
         elif action == "copy":
@@ -440,6 +468,12 @@ def file_controller(
 
         elif action == "write":
             full = _full_path(path, name)
+            approved = _confirm(
+                f"JARVIS wants to write/overwrite:\n  {full}\n\nAllow?",
+                player
+            )
+            if not approved:
+                return "Action blocked by user."
             result = write_file(
                 full,
                 content=content,
@@ -464,6 +498,12 @@ def file_controller(
             result = get_disk_usage(path)
 
         elif action == "organize_desktop":
+            approved = _confirm(
+                "JARVIS wants to organize your Desktop by moving files into folders.\n\nAllow?",
+                player
+            )
+            if not approved:
+                return "Action blocked by user."
             result = organize_desktop()
 
         elif action == "info":

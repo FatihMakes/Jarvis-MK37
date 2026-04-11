@@ -1,4 +1,4 @@
-import os, json, time, math, random, threading
+import os, time, math, random, threading, queue
 import tkinter as tk
 from collections import deque
 from PIL import Image, ImageTk, ImageDraw
@@ -12,9 +12,8 @@ def get_base_dir():
     return Path(__file__).resolve().parent
 
 
-BASE_DIR   = get_base_dir()
-CONFIG_DIR = BASE_DIR / "config"
-API_FILE   = CONFIG_DIR / "api_keys.json"
+BASE_DIR  = get_base_dir()
+ENV_FILE  = BASE_DIR / ".env"
 
 SYSTEM_NAME = "J.A.R.V.I.S"
 MODEL_BADGE = "MARK XXX"
@@ -69,6 +68,10 @@ class JarvisUI:
         self.typing_queue = deque()
         self.is_typing    = False
 
+        # Thread-safe message bus — background threads put events here;
+        # _poll_queue() reads them exclusively from the Tk main thread.
+        self._gui_queue = queue.Queue()
+
         self._face_pil         = None
         self._has_face         = False
         self._face_scale_cache = None
@@ -98,6 +101,7 @@ class JarvisUI:
             self._show_setup_ui()
 
         self._animate()
+        self._poll_queue()
         self.root.protocol("WM_DELETE_WINDOW", lambda: os._exit(0))
 
     def _load_face(self, path):
@@ -292,13 +296,41 @@ class JarvisUI:
                       text="FatihMakes Industries  ·  CLASSIFIED  ·  MARK XXX")
 
     def write_log(self, text: str):
-        self.typing_queue.append(text)
-        tl = text.lower()
-        self.status_text = ("PROCESSING" if tl.startswith("you:")
-                            else "RESPONDING" if tl.startswith("ai:")
-                            else self.status_text)
-        if not self.is_typing:
-            self._start_typing()
+        """Thread-safe: any thread may call this."""
+        self._gui_queue.put(("log", text))
+
+    def start_speaking(self):
+        """Thread-safe: any thread may call this."""
+        self._gui_queue.put(("speaking", True))
+
+    def stop_speaking(self):
+        """Thread-safe: any thread may call this."""
+        self._gui_queue.put(("speaking", False))
+
+    def _poll_queue(self):
+        """
+        Runs exclusively on the Tk main thread every 50 ms.
+        Drains _gui_queue and applies GUI mutations safely.
+        """
+        try:
+            while True:
+                kind, value = self._gui_queue.get_nowait()
+                if kind == "log":
+                    tl = value.lower()
+                    self.status_text = (
+                        "PROCESSING" if tl.startswith("you:")
+                        else "RESPONDING" if tl.startswith("jarvis:")
+                        else self.status_text
+                    )
+                    self.typing_queue.append(value)
+                    if not self.is_typing:
+                        self._start_typing()
+                elif kind == "speaking":
+                    self.speaking    = value
+                    self.status_text = "SPEAKING" if value else "ONLINE"
+        except queue.Empty:
+            pass
+        self.root.after(50, self._poll_queue)
 
     def _start_typing(self):
         if not self.typing_queue:
@@ -309,7 +341,7 @@ class JarvisUI:
         self.is_typing = True
         text = self.typing_queue.popleft()
         tl   = text.lower()
-        tag  = "you" if tl.startswith("you:") else "ai" if tl.startswith("ai:") else "sys"
+        tag  = "you" if tl.startswith("you:") else "ai" if tl.startswith("jarvis:") else "sys"
         self.log_text.configure(state="normal")
         self._type_char(text, 0, tag)
 
@@ -323,16 +355,15 @@ class JarvisUI:
             self.log_text.configure(state="disabled")
             self.root.after(25, self._start_typing)
 
-    def start_speaking(self):
-        self.speaking    = True
-        self.status_text = "SPEAKING"
-
-    def stop_speaking(self):
-        self.speaking    = False
-        self.status_text = "ONLINE"
-
-    def _api_keys_exist(self):
-        return API_FILE.exists()
+    def _api_keys_exist(self) -> bool:
+        """Returns True only when .env already holds a non-empty GEMINI_API_KEY."""
+        if not ENV_FILE.exists():
+            return False
+        content = ENV_FILE.read_text(encoding="utf-8")
+        return any(
+            line.startswith("GEMINI_API_KEY=") and len(line.split("=", 1)[1].strip()) > 0
+            for line in content.splitlines()
+        )
 
     def wait_for_api_key(self):
         """Block until API key is saved (called from main thread before starting JARVIS)."""
@@ -371,9 +402,9 @@ class JarvisUI:
         gemini = self.gemini_entry.get().strip()
         if not gemini:
             return
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(API_FILE, "w", encoding="utf-8") as f:
-            json.dump({"gemini_api_key": gemini}, f, indent=4)
+        # Write key to .env so it is never committed to version control.
+        with open(ENV_FILE, "w", encoding="utf-8") as f:
+            f.write(f"GEMINI_API_KEY={gemini}\n")
         self.setup_frame.destroy()
         self._api_key_ready = True
         self.status_text = "ONLINE"

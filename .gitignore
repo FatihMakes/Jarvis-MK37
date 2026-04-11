@@ -1,0 +1,26 @@
+# Secrets — never commit these
+.env
+config/api_keys.json
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.egg-info/
+
+# IDE metadata
+.vscode/
+.idea/
+
+# PyInstaller output
+*.exe

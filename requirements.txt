@@ -2,6 +2,7 @@ pyaudio
 google-genai
 google-generativeai
 pillow
+python-dotenv
 requests
 beautifulsoup4
 playwright

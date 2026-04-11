@@ -1,4 +1,4 @@
-# 🤖 MARK XXX
+#  MARK XXX
 
 **Watch The Detailed Video To Set-up This Model**: https://www.youtube.com/watch?v=-YjbWjv1tJg
 
@@ -8,7 +8,7 @@ A real-time voice AI that can hear, see, understand, and control your Windows co
 Local execution. Zero subscriptions(Unless you want to increase request by buying requests from Google AI Studio).
 Built for intelligent automation.
 
-## ✨ Overview
+##  Overview
 
 **MARK XXX** is an advanced voice-driven AI assistant designed to turn your computer into an interactive intelligent system.
 
@@ -17,7 +17,7 @@ Speak naturally — it listens, understands context, responds with a human-like 
 Designed for speed, autonomy, and real-world usability.
 
 
-## 🚀 Capabilities
+##  Capabilities
 
 * **Real-time voice interaction** — Natural conversation with instant response
 * **System control** — Launch apps, manage files, execute commands
@@ -26,7 +26,7 @@ Designed for speed, autonomy, and real-world usability.
 * **Persistent memory** — Learns preferences and remembers context
 * **Integrated tools** — Web search, weather, reminders, messaging, code help, image generation
 
-## ⚡ Quick Start
+##  Quick Start
 
 ```bash
 git clone github.com/FatihMakes/Mark-XXX.git
@@ -43,14 +43,14 @@ If you got some problems or questions to ask or just want to support;
 YouTube Account: [text](https://www.youtube.com/@FatihMakes)
 Instagram Account: [text](https://www.instagram.com/fatihmakes/)
 
-## 📋 Requirements
+##  Requirements
 
 * Windows 10 / 11
 * Python 3.10 or newer
 * Microphone
 * Gemini API key
 
-## ⚠️ License
+##  License
 
 Personal and non-commercial use only.
 Licensed under **Creative Commons BY-NC 4.0**.

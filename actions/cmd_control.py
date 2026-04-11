@@ -1,6 +1,6 @@
 import subprocess
+import os
 import sys
-import json
 import re
 from pathlib import Path
 
@@ -10,13 +10,32 @@ def get_base_dir():
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent.parent
 
-BASE_DIR        = get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
+BASE_DIR = get_base_dir()
 
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    """Reads key from environment — loaded by dotenv in main.py at startup."""
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not set in environment.")
+    return key
+
+
+def _confirm(prompt: str, player=None) -> bool:
+    """
+    Asks the user for explicit approval before executing a dangerous action.
+    Uses Tkinter messagebox when a UI player is available, terminal input otherwise.
+    Returns True if the user approves, False to block.
+    """
+    if player and hasattr(player, "root"):
+        import tkinter.messagebox as mb
+        return mb.askyesno(
+            "JARVIS — Action Requires Approval",
+            prompt,
+            parent=player.root
+        )
+    answer = input(f"[JARVIS SANDBOX] {prompt} [Y/N]: ").strip().lower()
+    return answer in ("y", "yes")
 
 
 def _get_platform() -> str:
@@ -214,6 +233,14 @@ def cmd_control(
     safe, reason = _is_safe(command)
     if not safe:
         return f"Blocked for safety: {reason}"
+
+    # Require explicit user approval before touching the OS.
+    approved = _confirm(
+        f"JARVIS wants to run the following command:\n\n  {command}\n\nAllow?",
+        player
+    )
+    if not approved:
+        return "Action blocked by user."
 
     if player:
         player.write_log(f"[CMD] {command[:60]}")
