@@ -1,3 +1,5 @@
+import asyncio
+
 try:
     import websockets.asyncio.client as _ws_client
 except ImportError:
