@@ -29,9 +29,16 @@ Designed for speed, autonomy, and real-world usability.
 ## ⚡ Quick Start
 
 ```bash
-git clone github.com/FatihMakes/Mark-XXX.git
-cd mark-xxx
+git clone https://github.com/FatihMakes/Mark-XXX.git
+cd Mark-XXX
+
+# 1. Run the automated setup
 python setup.py
+
+# 2. Activate the virtual environment
+.\venv\Scripts\activate
+
+# 3. Start the assistant
 python main.py
 ```
 

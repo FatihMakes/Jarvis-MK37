@@ -1,10 +1,34 @@
 import asyncio
+import websockets.asyncio.client
+
+# Fix for websockets timing out on VPNs (default 10s is too short for some proxies)
+_orig_ws_connect = websockets.asyncio.client.connect
+def _patched_ws_connect(*args, **kwargs):
+    if 'open_timeout' not in kwargs:
+        kwargs['open_timeout'] = 60
+    return _orig_ws_connect(*args, **kwargs)
+websockets.asyncio.client.connect = _patched_ws_connect
 import threading
 import json
 import re
 import sys
+if sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
 import traceback
 from pathlib import Path
+import urllib.request
+
+# Fix for websockets timing out on Windows proxies due to local DNS blocking
+_orig_getproxies = urllib.request.getproxies
+def _patched_getproxies():
+    p = _orig_getproxies()
+    # Use socks5h to force REMOTE DNS resolution over the VPN proxy.
+    # This bypasses local ISP DNS blocks that cause timeouts.
+    for k, v in list(p.items()):
+        if isinstance(v, str) and v.startswith("socks://"):
+            p[k] = v.replace("socks://", "socks5h://")
+    return p
+urllib.request.getproxies = _patched_getproxies
 
 import pyaudio
 from google import genai
@@ -810,10 +834,7 @@ class JarvisLive:
                 print("[JARVIS] 🔌 Connecting...")
                 config = self._build_config()
 
-                async with (
-                    client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
-                    asyncio.TaskGroup() as tg,
-                ):
+                async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
                     self.session        = session
                     self._loop          = asyncio.get_event_loop() 
                     self.audio_in_queue = asyncio.Queue()
@@ -822,10 +843,12 @@ class JarvisLive:
                     print("[JARVIS] ✅ Connected.")
                     self.ui.write_log("JARVIS online.")
 
-                    tg.create_task(self._send_realtime())
-                    tg.create_task(self._listen_audio())
-                    tg.create_task(self._receive_audio())
-                    tg.create_task(self._play_audio())
+                    await asyncio.gather(
+                        self._send_realtime(),
+                        self._listen_audio(),
+                        self._receive_audio(),
+                        self._play_audio()
+                    )
 
             except Exception as e:
                 print(f"[JARVIS] ⚠️  Error: {e}")

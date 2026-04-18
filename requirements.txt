@@ -1,7 +1,7 @@
 pyaudio
 google-genai
 google-generativeai
-pillow
+Pillow
 requests
 beautifulsoup4
 playwright
@@ -17,3 +17,5 @@ pycaw
 win10toast
 duckduckgo-search
 youtube-transcript-api
+python-socks[asyncio]
+httpx[socks]
