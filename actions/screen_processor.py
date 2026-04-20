@@ -4,8 +4,14 @@ import asyncio
 import base64
 import io
 import json
+import os
 import re
 import sys
+import subprocess
+import tempfile
+import uuid
+import shutil
+import select
 import threading
 import time
 from pathlib import Path
@@ -72,7 +78,7 @@ def _get_api_key() -> str:
 def _get_os() -> str:
     return _load_config().get("os_system", "windows").lower()
 
-_LIVE_MODEL         = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+_LIVE_MODEL         = "models/gemini-3.1-flash-live-preview"
 _CHANNELS           = 1
 _RECEIVE_SAMPLE_RATE = 24_000
 _CHUNK_SIZE         = 1_024
@@ -105,18 +111,632 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
         print(f"[Vision] ⚠️  Image compress failed: {e}")
         return img_bytes, f"image/{source_format.lower()}"
 
-def _capture_screen() -> tuple[bytes, str]:
 
-    if not _MSS:
-        raise RuntimeError("mss is not installed. Run: pip install mss")
+# === LINUX WAYLAND COMPATIBLE SCREEN CAPTURE ===
+def _encode_screen_image(image) -> bytes:
+    import io
+
+    from PIL import Image
+
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    image.thumbnail((1280, 720), Image.Resampling.LANCZOS)
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=85, optimize=True)
+    return buffer.getvalue()
+
+
+def _capture_screen_with_mss() -> bytes:
+    import mss
+    from PIL import Image
 
     with mss.mss() as sct:
-        monitors = sct.monitors          # [0] = all combined, [1..n] = real screens
-        target   = monitors[1] if len(monitors) > 1 else monitors[0]
-        shot     = sct.grab(target)
-        png      = mss.tools.to_png(shot.rgb, shot.size)
+        monitor = sct.monitors[0]
+        grabbed = sct.grab(monitor)
+        image = Image.frombytes("RGB", grabbed.size, grabbed.bgra, "raw", "BGRX")
+        return _encode_screen_image(image)
 
-    return _compress(png, "PNG")
+
+def _capture_screen_with_file_backend(command: list[str]) -> bytes:
+    from PIL import Image
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        completed = subprocess.run(
+            [*command, tmp_path],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        _ = completed
+
+        with Image.open(tmp_path) as image:
+            return _encode_screen_image(image)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{command[0]} is not installed") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        if stderr:
+            raise RuntimeError(f"{command[0]} failed: {stderr}") from exc
+        raise RuntimeError(f"{command[0]} failed with exit code {exc.returncode}") from exc
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+
+def _capture_screen_with_wayland() -> bytes:
+    errors = []
+
+    try:
+        return _capture_screen_with_portal_system_python()
+    except Exception as exc:
+        errors.append(f"portal: {exc}")
+
+    if shutil.which("grim"):
+        try:
+            return _capture_screen_with_file_backend(["grim"])
+        except Exception as exc:
+            errors.append(f"grim: {exc}")
+
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+    raise RuntimeError(
+        "Wayland session detected, but no supported screenshot backend is installed. "
+        "Install 'xdg-desktop-portal' and, on GNOME, 'xdg-desktop-portal-gnome'; "
+        "or use 'grim'."
+    )
+
+
+def _find_system_python() -> str | None:
+    candidates = [
+        "/usr/bin/python3",
+        "/usr/bin/python",
+        os.path.join(sys.base_prefix, "bin", "python3"),
+        os.path.join(sys.base_prefix, "bin", "python"),
+        shutil.which("python3"),
+        shutil.which("python"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if os.path.exists(candidate):
+            probe = subprocess.run(
+                [
+                    candidate,
+                    "-c",
+                    "import dbus, gi; print('ok')",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if probe.returncode == 0:
+                return candidate
+    return None
+
+
+def _capture_screen_with_portal_system_python() -> bytes:
+    helper_python = _find_system_python()
+    if not helper_python:
+        raise RuntimeError("could not find a system Python with portal support")
+
+    helper_script = r'''
+import dbus
+import dbus.mainloop.glib
+import json
+import sys
+import subprocess
+import tempfile
+import uuid
+import shutil
+import select
+import uuid
+from gi.repository import GLib
+
+dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+bus = dbus.SessionBus()
+token = "jarvis_" + uuid.uuid4().hex
+unique_name = bus.get_unique_name().replace(":", "").replace(".", "_")
+handle_path = f"/org/freedesktop/portal/desktop/request/{unique_name}/{token}"
+result = {}
+
+def on_response(response, results):
+    result["response"] = int(response)
+    try:
+        result["results"] = dict(results)
+    except Exception:
+        result["results"] = {"_raw": str(results)}
+    loop.quit()
+
+bus.add_signal_receiver(
+    on_response,
+    signal_name="Response",
+    dbus_interface="org.freedesktop.portal.Request",
+    path=handle_path,
+)
+
+proxy = bus.get_object("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
+iface = dbus.Interface(proxy, "org.freedesktop.portal.Screenshot")
+options = dbus.Dictionary(
+    {
+        "handle_token": token,
+        "modal": dbus.Boolean(True),
+        "interactive": dbus.Boolean(False),
+    },
+    signature="sv",
+)
+
+loop = GLib.MainLoop()
+iface.Screenshot("", options, timeout=5000)
+
+def on_timeout():
+    if "response" not in result:
+        result["error"] = "timed out waiting for portal response"
+        loop.quit()
+    return False
+
+GLib.timeout_add_seconds(12, on_timeout)
+loop.run()
+
+print(json.dumps(result))
+'''
+
+    completed = subprocess.run(
+        [helper_python, "-c", helper_script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        detail = stderr or stdout or f"exit code {completed.returncode}"
+        raise RuntimeError(f"portal helper failed: {detail}")
+
+    payload = (completed.stdout or "").strip()
+    if not payload:
+        raise RuntimeError("portal helper returned no data")
+
+    try:
+        result = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"portal helper returned invalid JSON: {payload!r}") from exc
+
+    if "error" in result:
+        raise RuntimeError(result["error"])
+
+    if int(result.get("response", -1)) != 0:
+        raise RuntimeError("portal screenshot was denied or cancelled")
+
+    uri = str((result.get("results") or {}).get("uri", ""))
+    if not uri:
+        raise RuntimeError("portal screenshot did not return an image URI")
+
+    from urllib.parse import unquote, urlparse
+    from PIL import Image
+
+    file_path = unquote(urlparse(uri).path)
+    if not file_path:
+        raise RuntimeError(f"portal returned a non-local URI: {uri}")
+
+    with Image.open(file_path) as image:
+        image.load()
+        return _encode_screen_image(image)
+
+
+def _capture_screen_with_portal_qtdbus() -> bytes:
+    bus = QDBusConnection.sessionBus()
+    if not bus.isConnected():
+        raise RuntimeError("cannot access session D-Bus")
+
+    token = f"jarvis_{uuid.uuid4().hex}"
+    options = {
+        "handle_token": token,
+        "modal": True,
+        "interactive": False,
+    }
+
+    request = QDBusMessage.createMethodCall(
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Screenshot",
+        "Screenshot",
+    )
+    request.setArguments(["", options])
+
+    reply = bus.call(request, QDBus.CallMode.Block, 5000)
+    if reply.type() == QDBusMessage.MessageType.ErrorMessage:
+        detail = reply.errorMessage() or reply.errorName() or "unknown error"
+        raise RuntimeError(f"portal call failed: {detail}")
+
+    reply_args = reply.arguments()
+    if not reply_args:
+        raise RuntimeError("portal call did not return a request handle")
+
+    handle_path = str(reply_args[0])
+    if not handle_path:
+        raise RuntimeError("portal call returned an empty request handle")
+
+    class _PortalResponseReceiver(QObject):
+        def __init__(self):
+            super().__init__()
+            self.response_code = None
+            self.results = None
+            self.loop = None
+
+        @pyqtSlot(int, "QVariantMap")
+        def on_response(self, response_code, results):
+            if self.response_code is not None:
+                return
+            self.response_code = int(response_code)
+            if isinstance(results, dict):
+                self.results = results
+            else:
+                try:
+                    self.results = dict(results)
+                except Exception:
+                    self.results = {"_raw": results}
+            if self.loop is not None and self.loop.isRunning():
+                self.loop.quit()
+
+    receiver = _PortalResponseReceiver()
+    connected = bus.connect(
+        "org.freedesktop.portal.Desktop",
+        handle_path,
+        "org.freedesktop.portal.Request",
+        "Response",
+        "ua{sv}",
+        receiver.on_response,
+    )
+    if not connected:
+        raise RuntimeError("could not subscribe to portal response")
+
+    loop = QEventLoop()
+    receiver.loop = loop
+    timeout_ms = 12000
+    QTimer.singleShot(timeout_ms, loop.quit)
+
+    try:
+        loop.exec()
+    finally:
+        try:
+            bus.disconnect(
+                "org.freedesktop.portal.Desktop",
+                handle_path,
+                "org.freedesktop.portal.Request",
+                "Response",
+                "ua{sv}",
+                receiver.on_response,
+            )
+        except Exception:
+            pass
+
+    if receiver.response_code is None:
+        raise RuntimeError(f"timed out waiting for portal response after {timeout_ms // 1000}s")
+
+    if receiver.response_code != 0:
+        raise RuntimeError("portal screenshot was denied or cancelled")
+
+    uri = str((receiver.results or {}).get("uri", ""))
+    if not uri:
+        raise RuntimeError("portal response did not include a screenshot URI")
+
+    from urllib.parse import unquote, urlparse
+    from PIL import Image
+
+    file_path = unquote(urlparse(uri).path)
+    if not file_path:
+        raise RuntimeError(f"portal returned a non-local URI: {uri}")
+
+    with Image.open(file_path) as image:
+        image.load()
+        return _encode_screen_image(image)
+
+
+def _capture_screen_with_portal_via_gdbus() -> bytes:
+    token = f"jarvis_{uuid.uuid4().hex}"
+    options = "{'handle_token': <'%s'>, 'modal': <true>, 'interactive': <false>}" % token
+    monitor_cmd = [
+        "dbus-monitor",
+        "--session",
+        "type='signal',interface='org.freedesktop.portal.Request',member='Response'",
+    ]
+    monitor = subprocess.Popen(
+        monitor_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    time.sleep(0.2)
+
+    call_cmd = [
+        "gdbus",
+        "call",
+        "--session",
+        "--dest",
+        "org.freedesktop.portal.Desktop",
+        "--object-path",
+        "/org/freedesktop/portal/desktop",
+        "--method",
+        "org.freedesktop.portal.Screenshot.Screenshot",
+        "",
+        options,
+    ]
+
+    completed = subprocess.run(
+        call_cmd,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        detail = stderr or stdout or f"exit code {completed.returncode}"
+        raise RuntimeError(f"gdbus portal call failed: {detail}")
+
+    handle_match = re.search(
+        r"(/org/freedesktop/portal/desktop/request/[^\s'\"()]+)",
+        completed.stdout or "",
+    )
+    if not handle_match:
+        raise RuntimeError(f"could not parse portal request handle from: {completed.stdout!r}")
+    handle_path = handle_match.group(1)
+
+    lines = []
+    uri = None
+    response_code = None
+    deadline = time.time() + 30.0
+
+    try:
+        while time.time() < deadline:
+            remaining = max(0.0, deadline - time.time())
+            ready, _, _ = select.select([monitor.stdout], [], [], min(0.5, remaining))
+            if not ready:
+                if monitor.poll() is not None:
+                    break
+                continue
+
+            line = monitor.stdout.readline()
+            if not line:
+                if monitor.poll() is not None:
+                    break
+                continue
+
+            lines.append(line.rstrip())
+
+            if response_code is None:
+                match = re.search(r"uint32\s+(\d+)", line)
+                if match:
+                    response_code = int(match.group(1))
+
+            if uri is None:
+                match = re.search(r"file://[^\s'\"<>]+", line)
+                if match:
+                    uri = match.group(0)
+
+            if handle_path not in "".join(lines):
+                continue
+
+            if response_code is not None and uri is not None:
+                break
+    finally:
+        try:
+            monitor.terminate()
+        except Exception:
+            pass
+        try:
+            monitor.wait(timeout=3)
+        except Exception:
+            try:
+                monitor.kill()
+            except Exception:
+                pass
+
+    if response_code is None:
+        raise RuntimeError(
+            "timed out waiting for portal response; monitor output: "
+            + " | ".join(lines[-5:])
+        )
+    if response_code != 0:
+        raise RuntimeError("portal screenshot was denied or cancelled")
+    if not uri:
+        raise RuntimeError(
+            "portal response did not include a screenshot URI; monitor output: "
+            + " | ".join(lines[-5:])
+        )
+
+    from urllib.parse import urlparse, unquote
+    from PIL import Image
+
+    file_path = unquote(urlparse(uri).path)
+    if not file_path:
+        raise RuntimeError(f"portal returned a non-local URI: {uri}")
+
+    with Image.open(file_path) as image:
+        image.load()
+        return _encode_screen_image(image)
+
+
+def _capture_screen_with_portal() -> bytes:
+    try:
+        from gi.repository import Gio, GLib
+    except Exception as exc:
+        raise RuntimeError(f"portal backend unavailable: {exc}") from exc
+
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except Exception as exc:
+        raise RuntimeError(f"cannot access session bus: {exc}") from exc
+
+    token = f"jarvis_{uuid.uuid4().hex}"
+    unique_name = bus.get_unique_name().replace(":", "").replace(".", "_")
+    handle_path = f"/org/freedesktop/portal/desktop/request/{unique_name}/{token}"
+
+    options = GLib.Variant(
+        "a{sv}",
+        {
+            "modal": GLib.Variant("b", True),
+            "interactive": GLib.Variant("b", False),
+            "handle_token": GLib.Variant("s", token),
+        },
+    )
+
+    subscription_id = None
+    result = {}
+    loop = GLib.MainLoop()
+
+    def on_response(
+        connection, sender_name, object_path, interface_name, signal_name, parameters
+    ):
+        try:
+            response_code, results = parameters.unpack()
+        except Exception as exc:
+            result["error"] = f"invalid portal response: {exc}"
+        else:
+            result["response"] = int(response_code)
+            result["results"] = results
+        loop.quit()
+
+    subscription_id = bus.signal_subscribe(
+        "org.freedesktop.portal.Desktop",
+        "org.freedesktop.portal.Request",
+        "Response",
+        handle_path,
+        None,
+        Gio.DBusSignalFlags.NONE,
+        on_response,
+    )
+
+    portal = Gio.DBusProxy.new_sync(
+        bus,
+        Gio.DBusProxyFlags.NONE,
+        None,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Screenshot",
+        None,
+    )
+
+    try:
+        response = portal.call_sync(
+            "Screenshot",
+            GLib.Variant("(sa{sv})", ("", options)),
+            Gio.DBusCallFlags.NONE,
+            20000,
+            None,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"portal request failed: {exc}") from exc
+
+    handle = response.unpack()[0]
+    if handle != handle_path:
+        try:
+            bus.signal_unsubscribe(subscription_id)
+        except Exception:
+            pass
+        handle_path = handle
+        subscription_id = bus.signal_subscribe(
+            "org.freedesktop.portal.Desktop",
+            "org.freedesktop.portal.Request",
+            "Response",
+            handle_path,
+            None,
+            Gio.DBusSignalFlags.NONE,
+            on_response,
+        )
+
+    def on_timeout():
+        result["error"] = "timed out waiting for portal response"
+        loop.quit()
+        return False
+
+    timeout_id = GLib.timeout_add_seconds(20, on_timeout)
+    try:
+        loop.run()
+    finally:
+        try:
+            GLib.source_remove(timeout_id)
+        except Exception:
+            pass
+        try:
+            bus.signal_unsubscribe(subscription_id)
+        except Exception:
+            pass
+
+    if "error" in result:
+        raise RuntimeError(result["error"])
+
+    if result["response"] != 0:
+        raise RuntimeError("portal screenshot was denied or cancelled")
+
+    uri = str(result["results"].get("uri", ""))
+    if not uri:
+        raise RuntimeError("portal screenshot did not return an image URI")
+
+    from PIL import Image
+    file = Gio.File.new_for_uri(uri)
+    path = file.get_path()
+    if not path:
+        raise RuntimeError(f"portal returned a non-local URI: {uri}")
+
+    with Image.open(path) as image:
+        image.load()
+        return _encode_screen_image(image)
+
+
+def capture_screen() -> bytes | str:
+    """Capture the full desktop, downscale to 1280x720, and return JPEG bytes."""
+    try:
+        wayland_session = bool(
+            os.environ.get("WAYLAND_DISPLAY")
+            or os.environ.get("XDG_SESSION_TYPE") == "wayland"
+        )
+
+        backends = (
+            (_capture_screen_with_wayland, _capture_screen_with_mss)
+            if wayland_session
+            else (_capture_screen_with_mss, _capture_screen_with_wayland)
+        )
+
+        errors = []
+        for backend in backends:
+            try:
+                return backend()
+            except Exception as exc:
+                errors.append(str(exc))
+
+        if errors:
+            return f"ERROR: {'; '.join(errors)}"
+        return "ERROR: No screenshot backend is available."
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+
+# ===============================================
+
+def _capture_screen() -> tuple[bytes, str]:
+    result = capture_screen()
+    if isinstance(result, str) and result.startswith("ERROR"):
+        raise RuntimeError(result)
+    elif isinstance(result, str):
+        # some other string?
+        raise RuntimeError(result)
+    return result, "image/jpeg"
+
 
 
 def _cv2_backend() -> int:

@@ -8,7 +8,11 @@ from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote_plus
 
-import pyautogui
+try:
+    import pyautogui
+    _PYAUTOGUI = True
+except Exception:
+    _PYAUTOGUI = False
 import numpy as np
 
 try:

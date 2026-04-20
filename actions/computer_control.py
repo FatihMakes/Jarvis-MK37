@@ -13,13 +13,13 @@ try:
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE    = 0.05
     _PYAUTOGUI = True
-except ImportError:
+except Exception:
     _PYAUTOGUI = False
 
 try:
     import pyperclip
     _PYPERCLIP = True
-except ImportError:
+except Exception:
     _PYPERCLIP = False
 
 def _base_dir() -> Path:

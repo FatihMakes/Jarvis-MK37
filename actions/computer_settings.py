@@ -11,13 +11,13 @@ try:
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE    = 0.05
     _PYAUTOGUI = True
-except ImportError:
+except Exception:
     _PYAUTOGUI = False
 
 try:
     import pyperclip
     _PYPERCLIP = True
-except ImportError:
+except Exception:
     _PYPERCLIP = False
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
@@ -57,8 +57,13 @@ def volume_up():
             "set volume output volume (output volume of (get volume settings) + 10)"],
             capture_output=True)
     else:
-        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+10%"],
-            capture_output=True)
+        # Linux: try wpctl (PipeWire), then pactl (PulseAudio), then amixer (ALSA)
+        if shutil.which("wpctl"):
+            subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "10%+"], capture_output=True)
+        elif shutil.which("pactl"):
+            subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+10%"], capture_output=True)
+        else:
+            subprocess.run(["amixer", "-D", "pulse", "sset", "Master", "10%+"], capture_output=True)
 
 def volume_down():
     if _OS == "Windows":
@@ -68,8 +73,12 @@ def volume_down():
             "set volume output volume (output volume of (get volume settings) - 10)"],
             capture_output=True)
     else:
-        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "-10%"],
-            capture_output=True)
+        if shutil.which("wpctl"):
+            subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "10%-"], capture_output=True)
+        elif shutil.which("pactl"):
+            subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "-10%"], capture_output=True)
+        else:
+            subprocess.run(["amixer", "-D", "pulse", "sset", "Master", "10%-"], capture_output=True)
 
 def volume_mute():
     if _OS == "Windows":
@@ -78,8 +87,12 @@ def volume_mute():
         subprocess.run(["osascript", "-e", "set volume with output muted"],
             capture_output=True)
     else:
-        subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"],
-            capture_output=True)
+        if shutil.which("wpctl"):
+            subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], capture_output=True)
+        elif shutil.which("pactl"):
+            subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"], capture_output=True)
+        else:
+            subprocess.run(["amixer", "-D", "pulse", "set", "Master", "toggle"], capture_output=True)
 
 def volume_set(value: int):
     value = max(0, min(100, int(value)))
@@ -104,8 +117,13 @@ def volume_set(value: int):
             capture_output=True)
         return
     else:
-        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"],
-            capture_output=True)
+        val_float = value / 100.0
+        if shutil.which("wpctl"):
+            subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", str(val_float)], capture_output=True)
+        elif shutil.which("pactl"):
+            subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"], capture_output=True)
+        else:
+            subprocess.run(["amixer", "-D", "pulse", "sset", "Master", f"{value}%"], capture_output=True)
         return
 
 def brightness_up():
@@ -686,3 +704,37 @@ def computer_settings(
     except Exception as e:
         print(f"[Settings] Action failed ({action}): {e}")
         return f"Action failed ({action}): {e}"
+def get_system_status(parameters=None, player=None):
+    """Returns CPU and RAM usage and OS info."""
+    import psutil
+    try:
+        cpu = psutil.cpu_percent(interval=0.1)
+        mem = psutil.virtual_memory().percent
+        return f"System Status: OS: {platform.system()}, CPU Usage: {cpu}%, RAM Usage: {mem}%"
+    except Exception as e:
+        return f"Could not get system status: {e}"
+
+def media_control(parameters=None, player=None):
+    """Controls media playback (play/pause, next, previous)."""
+    action = (parameters or {}).get("action", "play_pause").lower()
+    if _OS == "linux":
+        # Requires playerctl
+        cmd_map = {"play_pause": "play-pause", "next": "next", "prev": "previous"}
+        cmd = cmd_map.get(action, "play-pause")
+        try:
+            subprocess.run(["playerctl", cmd], check=True, capture_output=True)
+            return f"Media: {action}"
+        except Exception:
+            # Fallback to key simulation if playerctl missing
+            if not _PYAUTOGUI: return "Error: playerctl not installed and pyautogui missing."
+            key_map = {"play_pause": "playpause", "next": "nexttrack", "prev": "prevtrack"}
+            import pyautogui
+            pyautogui.press(key_map.get(action, "playpause"))
+            return f"Media (simulated): {action}"
+    elif _OS == "windows":
+        if not _PYAUTOGUI: return "Error: pyautogui missing for media control."
+        import pyautogui
+        key_map = {"play_pause": "playpause", "next": "nexttrack", "prev": "prevtrack"}
+        pyautogui.press(key_map.get(action, "playpause"))
+        return f"Media: {action}"
+    return "Media control not implemented for this OS."

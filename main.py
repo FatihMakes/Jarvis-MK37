@@ -4,12 +4,13 @@ import threading
 import json
 import sys
 import traceback
+import platform
 from pathlib import Path
+from datetime import datetime
 
 import sounddevice as sd
 from google import genai
 from google.genai import types
-from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
 )
@@ -19,8 +20,8 @@ from actions.open_app          import open_app
 from actions.weather_report    import weather_action
 from actions.send_message      import send_message
 from actions.reminder          import reminder
-from actions.computer_settings import computer_settings
-from actions.screen_processor  import screen_process
+from actions.computer_settings import computer_settings, get_system_status as from_settings_get_status, media_control as from_settings_media_control
+from actions.screen_processor  import screen_process, capture_screen
 from actions.youtube_video     import youtube_video
 from actions.desktop           import desktop_control
 from actions.browser_control   import browser_control
@@ -30,51 +31,25 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
+from agent.tool_registry       import tool_registry
 
+def get_os() -> str:
+    s = platform.system().lower()
+    if s == "darwin": return "mac"
+    if s == "windows": return "windows"
+    return "linux"
 
-def get_base_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent
+BASE_DIR        = Path(__file__).resolve().parent
+CONFIG_DIR      = BASE_DIR / "config"
+API_CONFIG_PATH = CONFIG_DIR / "api_keys.json"
 
-
-BASE_DIR        = get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
-PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
-CHANNELS            = 1
-SEND_SAMPLE_RATE    = 16000
+SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE          = 1024
+CHANNELS = 1
+CHUNK_SIZE = 1024
 
+LIVE_MODEL          = "models/gemini-3.1-flash-live-preview"
 
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-
-
-def _load_system_prompt() -> str:
-    try:
-        return PROMPT_PATH.read_text(encoding="utf-8")
-    except Exception:
-        return (
-            "You are JARVIS, Tony Stark's AI assistant. "
-            "Be concise, direct, and always use the provided tools to complete tasks. "
-            "Never simulate or guess results — always call the appropriate tool."
-        )
-
-
-# ── Transkripsiyon temizleyici ─────────────────────────────────────────────────
-_CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
-
-def _clean_transcript(text: str) -> str:
-    """Gemini'nin ürettiği <ctrlXX> artefaktlarını ve kontrol karakterlerini temizler."""
-    text = _CTRL_RE.sub("", text)
-    text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
-    return text.strip()
-
-
-# ── Tool declarations ──────────────────────────────────────────────────────────
 TOOL_DECLARATIONS = [
     {
         "name": "open_app",
@@ -96,14 +71,11 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "web_search",
-        "description": "Searches the web for any information.",
+        "description": "Searches the web for information using DuckDuckGo.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "query":  {"type": "STRING", "description": "Search query"},
-                "mode":   {"type": "STRING", "description": "search (default) or compare"},
-                "items":  {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Items to compare"},
-                "aspect": {"type": "STRING", "description": "price | specs | reviews"}
+                "query": {"type": "STRING", "description": "The search query"}
             },
             "required": ["query"]
         }
@@ -121,46 +93,39 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "send_message",
-        "description": "Sends a text message via WhatsApp, Telegram, or other messaging platform.",
+        "description": "Sends a message via various platforms (WhatsApp, Telegram, etc.)",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "receiver":     {"type": "STRING", "description": "Recipient contact name"},
-                "message_text": {"type": "STRING", "description": "The message to send"},
-                "platform":     {"type": "STRING", "description": "Platform: WhatsApp, Telegram, etc."}
+                "receiver": {"type": "STRING", "description": "Name of the person or group"},
+                "message_text": {"type": "STRING", "description": "Content of the message"},
+                "platform": {"type": "STRING", "description": "Platform to use (e.g. 'whatsapp', 'telegram')"}
             },
             "required": ["receiver", "message_text", "platform"]
         }
     },
     {
         "name": "reminder",
-        "description": "Sets a timed reminder using Task Scheduler.",
+        "description": "Sets a reminder for the user.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "date":    {"type": "STRING", "description": "Date in YYYY-MM-DD format"},
-                "time":    {"type": "STRING", "description": "Time in HH:MM format (24h)"},
-                "message": {"type": "STRING", "description": "Reminder message text"}
+                "date": {"type": "STRING", "description": "Date (YYYY-MM-DD)"},
+                "time": {"type": "STRING", "description": "Time (HH:MM)"},
+                "message": {"type": "STRING", "description": "Reminder content"}
             },
             "required": ["date", "time", "message"]
         }
     },
     {
-        "name": "youtube_video",
-        "description": (
-            "Controls YouTube. Use for: playing videos, summarizing a video's content, "
-            "getting video info, or showing trending videos."
-        ),
+        "name": "computer_settings",
+        "description": "Manages computer settings (volume, brightness, wifi, dark mode, etc.)",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "play | summarize | get_info | trending (default: play)"},
-                "query":  {"type": "STRING", "description": "Search query for play action"},
-                "save":   {"type": "BOOLEAN", "description": "Save summary to Notepad (summarize only)"},
-                "region": {"type": "STRING", "description": "Country code for trending e.g. TR, US"},
-                "url":    {"type": "STRING", "description": "Video URL for get_info action"},
+                "action": {"type": "STRING", "description": "Action to perform (e.g. 'volume_up', 'brightness_down', 'toggle_wifi', 'dark_mode')"}
             },
-            "required": []
+            "required": ["action"]
         }
     },
     {
@@ -170,7 +135,7 @@ TOOL_DECLARATIONS = [
             "MUST be called when user asks what is on screen, what you see, "
             "analyze my screen, look at camera, etc. "
             "You have NO visual ability without this tool. "
-            "After calling this tool, stay SILENT — the vision module speaks directly."
+            "After calling this tool, I will automatically receive the current image and will be able to describe it."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -182,247 +147,161 @@ TOOL_DECLARATIONS = [
         }
     },
     {
-        "name": "computer_settings",
-        "description": (
-            "Controls the computer: volume, brightness, window management, keyboard shortcuts, "
-            "typing text on screen, closing apps, fullscreen, dark mode, WiFi, restart, shutdown, "
-            "scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. "
-            "Use for ANY single computer control command. NEVER route to agent_task."
-        ),
+        "name": "youtube_video",
+        "description": "Searches for and plays a video on YouTube.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "The action to perform"},
-                "description": {"type": "STRING", "description": "Natural language description of what to do"},
-                "value":       {"type": "STRING", "description": "Optional value: volume level, text to type, etc."}
+                "query": {"type": "STRING", "description": "The search query for YouTube"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "desktop_control",
+        "description": "Controls the desktop (mouse, keyboard, shortcuts).",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "Action to perform (e.g. 'maximize_window', 'minimize_window', 'press_enter', 'scroll_down')"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "browser_control",
+        "description": "Controls the web browser for advanced tasks.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "url": {"type": "STRING", "description": "URL to navigate to"},
+                "task": {"type": "STRING", "description": "Task to perform on the page"}
             },
             "required": []
         }
     },
     {
-        "name": "browser_control",
-        "description": (
-            "Controls any web browser. Use for: opening websites, searching the web, "
-            "clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. "
-            "Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', "
-            "'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action":      {"type": "STRING", "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"},
-                "browser":     {"type": "STRING", "description": "Target browser: chrome | edge | firefox | opera | operagx | brave | vivaldi | safari. Omit to use the currently active browser."},
-                "url":         {"type": "STRING", "description": "URL for go_to / new_tab action"},
-                "query":       {"type": "STRING", "description": "Search query for search action"},
-                "engine":      {"type": "STRING", "description": "Search engine: google | bing | duckduckgo | yandex (default: google)"},
-                "selector":    {"type": "STRING", "description": "CSS selector for click/type"},
-                "text":        {"type": "STRING", "description": "Text to click or type"},
-                "description": {"type": "STRING", "description": "Element description for smart_click/smart_type"},
-                "direction":   {"type": "STRING", "description": "up | down for scroll"},
-                "amount":      {"type": "INTEGER", "description": "Scroll amount in pixels (default: 500)"},
-                "key":         {"type": "STRING", "description": "Key name for press action (e.g. Enter, Escape, F5)"},
-                "path":        {"type": "STRING", "description": "Save path for screenshot"},
-                "incognito":   {"type": "BOOLEAN", "description": "Open in private/incognito mode"},
-                "clear_first": {"type": "BOOLEAN", "description": "Clear field before typing (default: true)"},
-            },
-            "required": ["action"]
-        }
-    },
-    {
         "name": "file_controller",
-        "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
+        "description": "Manages local files and directories.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"},
-                "path":        {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, home"},
-                "destination": {"type": "STRING", "description": "Destination path for move/copy"},
-                "new_name":    {"type": "STRING", "description": "New name for rename"},
-                "content":     {"type": "STRING", "description": "Content for create_file/write"},
-                "name":        {"type": "STRING", "description": "File name to search for"},
-                "extension":   {"type": "STRING", "description": "File extension to search (e.g. .pdf)"},
-                "count":       {"type": "INTEGER", "description": "Number of results for largest"},
-            },
-            "required": ["action"]
-        }
-    },
-    {
-        "name": "desktop_control",
-        "description": "Controls the desktop: wallpaper, organize, clean, list, stats.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action": {"type": "STRING", "description": "wallpaper | wallpaper_url | organize | clean | list | stats | task"},
-                "path":   {"type": "STRING", "description": "Image path for wallpaper"},
-                "url":    {"type": "STRING", "description": "Image URL for wallpaper_url"},
-                "mode":   {"type": "STRING", "description": "by_type or by_date for organize"},
-                "task":   {"type": "STRING", "description": "Natural language desktop task"},
+                "action": {"type": "STRING", "description": "Action to perform (e.g. 'list_files', 'read_file', 'create_dir', 'delete_file')"},
+                "path": {"type": "STRING", "description": "Target path"}
             },
             "required": ["action"]
         }
     },
     {
         "name": "code_helper",
-        "description": "Writes, edits, explains, runs, or builds code files.",
+        "description": "Assists with coding tasks, debugging, and analysis.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "write | edit | explain | run | build | auto (default: auto)"},
-                "description": {"type": "STRING", "description": "What the code should do or what change to make"},
-                "language":    {"type": "STRING", "description": "Programming language (default: python)"},
-                "output_path": {"type": "STRING", "description": "Where to save the file"},
-                "file_path":   {"type": "STRING", "description": "Path to existing file for edit/explain/run/build"},
-                "code":        {"type": "STRING", "description": "Raw code string for explain"},
-                "args":        {"type": "STRING", "description": "CLI arguments for run/build"},
-                "timeout":     {"type": "INTEGER", "description": "Execution timeout in seconds (default: 30)"},
+                "task": {"type": "STRING", "description": "Coding task or question"}
             },
-            "required": ["action"]
+            "required": ["task"]
         }
     },
     {
         "name": "dev_agent",
-        "description": "Builds complete multi-file projects from scratch: plans, writes files, installs deps, opens VSCode, runs and fixes errors.",
+        "description": "An advanced developer agent for complex software engineering tasks.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "description":  {"type": "STRING", "description": "What the project should do"},
-                "language":     {"type": "STRING", "description": "Programming language (default: python)"},
-                "project_name": {"type": "STRING", "description": "Optional project folder name"},
-                "timeout":      {"type": "INTEGER", "description": "Run timeout in seconds (default: 30)"},
-            },
-            "required": ["description"]
-        }
-    },
-    {
-        "name": "agent_task",
-        "description": (
-            "Executes complex multi-step tasks requiring multiple different tools. "
-            "Examples: 'research X and save to file', 'find and organize files'. "
-            "DO NOT use for single commands. NEVER use for Steam/Epic — use game_updater."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "goal":     {"type": "STRING", "description": "Complete description of what to accomplish"},
-                "priority": {"type": "STRING", "description": "low | normal | high (default: normal)"}
+                "goal": {"type": "STRING", "description": "Comprehensive engineering goal"}
             },
             "required": ["goal"]
         }
     },
     {
-        "name": "computer_control",
-        "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen.",
+        "name": "agent_task",
+        "description": "Submits a long-running goal to the Jarvis background agent queue.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | random_data | user_data"},
-                "text":        {"type": "STRING", "description": "Text to type or paste"},
-                "x":           {"type": "INTEGER", "description": "X coordinate"},
-                "y":           {"type": "INTEGER", "description": "Y coordinate"},
-                "keys":        {"type": "STRING", "description": "Key combination e.g. 'ctrl+c'"},
-                "key":         {"type": "STRING", "description": "Single key e.g. 'enter'"},
-                "direction":   {"type": "STRING", "description": "up | down | left | right"},
-                "amount":      {"type": "INTEGER", "description": "Scroll amount (default: 3)"},
-                "seconds":     {"type": "NUMBER",  "description": "Seconds to wait"},
-                "title":       {"type": "STRING",  "description": "Window title for focus_window"},
-                "description": {"type": "STRING",  "description": "Element description for screen_find/screen_click"},
-                "type":        {"type": "STRING",  "description": "Data type for random_data"},
-                "field":       {"type": "STRING",  "description": "Field for user_data: name|email|city"},
-                "clear_first": {"type": "BOOLEAN", "description": "Clear field before typing (default: true)"},
-                "path":        {"type": "STRING",  "description": "Save path for screenshot"},
+                "goal": {"type": "STRING", "description": "The background task goal"},
+                "priority": {"type": "STRING", "description": "Priority: low, normal, high"}
+            },
+            "required": ["goal"]
+        }
+    },
+    {
+        "name": "save_memory",
+        "description": "Saves a piece of information to long-term memory for future reference.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "category": {"type": "STRING", "description": "Memory category"},
+                "key": {"type": "STRING", "description": "Unique identifier"},
+                "value": {"type": "STRING", "description": "Information to remember"}
+            },
+            "required": ["key", "value"]
+        }
+    },
+    {
+        "name": "flight_finder",
+        "description": "Finds flights for given criteria.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "from": {"type": "STRING", "description": "Departure city"},
+                "to": {"type": "STRING", "description": "Arrival city"},
+                "date": {"type": "STRING", "description": "Date"}
+            },
+            "required": ["from", "to", "date"]
+        }
+    },
+    {
+        "name": "game_updater",
+        "description": "Checks for and manages game updates.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "game": {"type": "STRING", "description": "Game name"}
+            },
+            "required": ["game"]
+        }
+    },
+    {
+        "name": "media_control",
+        "description": "Controls media playback such as play/pause, next track, or previous track.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "Playback action: 'play_pause', 'next', or 'prev'"}
             },
             "required": ["action"]
         }
     },
     {
-        "name": "game_updater",
-        "description": (
-            "THE ONLY tool for ANY Steam or Epic Games request. "
-            "Use for: installing, downloading, updating games, listing installed games, "
-            "checking download status, scheduling updates. "
-            "ALWAYS call directly for any Steam/Epic/game request. "
-            "NEVER use agent_task, browser_control, or web_search for Steam/Epic."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action":    {"type": "STRING",  "description": "update | install | list | download_status | schedule | cancel_schedule | schedule_status (default: update)"},
-                "platform":  {"type": "STRING",  "description": "steam | epic | both (default: both)"},
-                "game_name": {"type": "STRING",  "description": "Game name (partial match supported)"},
-                "app_id":    {"type": "STRING",  "description": "Steam AppID for install (optional)"},
-                "hour":      {"type": "INTEGER", "description": "Hour for scheduled update 0-23 (default: 3)"},
-                "minute":    {"type": "INTEGER", "description": "Minute for scheduled update 0-59 (default: 0)"},
-                "shutdown_when_done": {"type": "BOOLEAN", "description": "Shut down PC when download finishes"},
-            },
-            "required": []
-        }
-    },
-    {
-        "name": "flight_finder",
-        "description": "Searches Google Flights and speaks the best options.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "origin":      {"type": "STRING",  "description": "Departure city or airport code"},
-                "destination": {"type": "STRING",  "description": "Arrival city or airport code"},
-                "date":        {"type": "STRING",  "description": "Departure date (any format)"},
-                "return_date": {"type": "STRING",  "description": "Return date for round trips"},
-                "passengers":  {"type": "INTEGER", "description": "Number of passengers (default: 1)"},
-                "cabin":       {"type": "STRING",  "description": "economy | premium | business | first"},
-                "save":        {"type": "BOOLEAN", "description": "Save results to Notepad"},
-            },
-            "required": ["origin", "destination", "date"]
-        }
+        "name": "get_system_status",
+        "description": "Returns information about the current system status including CPU and RAM usage.",
+        "parameters": {"type": "OBJECT", "properties": {}}
     },
     {
         "name": "shutdown_jarvis",
-        "description": (
-            "Shuts down the assistant completely. "
-            "Call this when the user expresses intent to end the conversation, "
-            "close the assistant, say goodbye, or stop Jarvis. "
-            "The user can say this in ANY language."
-        ),
+        "description": "Safely shuts down the Jarvis system.",
         "parameters": {
             "type": "OBJECT",
-            "properties": {},
+            "properties": {}
         }
-    },
-    {
-        "name": "save_memory",
-        "description": (
-            "Save an important personal fact about the user to long-term memory. "
-            "Call this silently whenever the user reveals something worth remembering: "
-            "name, age, city, job, preferences, hobbies, relationships, projects, or future plans. "
-            "Do NOT call for: weather, reminders, searches, or one-time commands. "
-            "Do NOT announce that you are saving — just call it silently. "
-            "Values must be in English regardless of the conversation language."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "category": {
-                    "type": "STRING",
-                    "description": (
-                        "identity — name, age, birthday, city, job, language, nationality | "
-                        "preferences — favorite food/color/music/film/game/sport, hobbies | "
-                        "projects — active projects, goals, things being built | "
-                        "relationships — friends, family, partner, colleagues | "
-                        "wishes — future plans, things to buy, travel dreams | "
-                        "notes — habits, schedule, anything else worth remembering"
-                    )
-                },
-                "key":   {"type": "STRING", "description": "Short snake_case key (e.g. name, favorite_food, sister_name)"},
-                "value": {"type": "STRING", "description": "Concise value in English (e.g. Fatih, pizza, older sister)"},
-            },
-            "required": ["category", "key", "value"]
-        }
-    },
+    }
 ]
 
+def _get_api_key():
+    if not API_CONFIG_PATH.exists():
+        raise FileNotFoundError(f"API config not found at {API_CONFIG_PATH}")
+    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)["gemini_api_key"]
+
+def _clean_transcript(text: str) -> str:
+    text = re.sub(r'\[.*?\]', '', text)
+    text = re.sub(r'\(.*?\)', '', text)
+    return text.strip()
 
 class JarvisLive:
-
-    def __init__(self, ui: JarvisUI):
+    def __init__(self, ui):
         self.ui             = ui
         self.session        = None
         self.audio_in_queue = None
@@ -433,14 +312,33 @@ class JarvisLive:
         self.ui.on_text_command = self._on_text_command
         self._turn_done_event: asyncio.Event | None = None
 
+        # Cache system prompt
+        sys_prompt_path = BASE_DIR / "core" / "prompt.txt"
+        self._sys_prompt = sys_prompt_path.read_text(encoding="utf-8") if sys_prompt_path.exists() else "You are JARVIS."
+
+        self.TOOL_MAP = {
+            "open_app":          open_app,
+            "web_search":        web_search_action,
+            "weather_report":    weather_action,
+            "send_message":      send_message,
+            "reminder":          reminder,
+            "computer_settings": computer_settings,
+            "youtube_video":     youtube_video,
+            "desktop_control":   desktop_control,
+            "browser_control":   browser_control,
+            "file_controller":   file_controller,
+            "code_helper":       code_helper,
+            "dev_agent":         dev_agent,
+            "game_updater":      game_updater,
+            "get_system_status": from_settings_get_status,
+            "media_control":     from_settings_media_control,
+        }
+
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
             return
         asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
+            self.session.send_realtime_input(text=text or "."),
             self._loop
         )
 
@@ -449,32 +347,21 @@ class JarvisLive:
             self._is_speaking = value
         if value:
             self.ui.set_state("SPEAKING")
-        elif not self.ui.muted:
+        else:
             self.ui.set_state("LISTENING")
 
     def speak(self, text: str):
-        if not self._loop or not self.session:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
+        print(f"[Jarvis] 🗣 {text}")
+        self.ui.write_log(f"Jarvis: {text}")
 
-    def speak_error(self, tool_name: str, error: str):
-        short = str(error)[:120]
-        self.ui.write_log(f"ERR: {tool_name} — {short}")
-        self.speak(f"Sir, {tool_name} encountered an error. {short}")
+    def speak_error(self, tool_name: str, error: Exception):
+        msg = f"Sir, the {tool_name} tool encountered an error: {error}"
+        self.speak(msg)
 
-    def _build_config(self) -> types.LiveConnectConfig:
-        from datetime import datetime
-
-        memory     = load_memory()
-        mem_str    = format_memory_for_prompt(memory)
-        sys_prompt = _load_system_prompt()
-
+    def _build_config(self):
+        mem      = load_memory()
+        mem_str  = format_memory_for_prompt(mem)
+        
         now      = datetime.now()
         time_str = now.strftime("%A, %B %d, %Y — %I:%M %p")
         time_ctx = (
@@ -486,7 +373,7 @@ class JarvisLive:
         parts = [time_ctx]
         if mem_str:
             parts.append(mem_str)
-        parts.append(sys_prompt)
+        parts.append(self._sys_prompt)
 
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
@@ -509,9 +396,11 @@ class JarvisLive:
         args = dict(fc.args or {})
 
         print(f"[JARVIS] 🔧 {name}  {args}")
+        arg_str = ", ".join(f"{k}={v}" for k, v in args.items()) if args else "no params"
+        self.ui.write_log(f"SYS: Running {name} ({arg_str})")
         self.ui.set_state("THINKING")
 
-        # ── save_memory: sessiz ve hızlı ──────────────────────────────────────
+        # Core tools that need direct session access or simple memory updates
         if name == "save_memory":
             category = args.get("category", "notes")
             key      = args.get("key", "")
@@ -526,95 +415,48 @@ class JarvisLive:
                 response={"result": "ok", "silent": True}
             )
 
-        loop   = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = "Done."
 
         try:
-            if name == "open_app":
-                r = await loop.run_in_executor(None, lambda: open_app(parameters=args, response=None, player=self.ui))
-                result = r or f"Opened {args.get('app_name')}."
+            # Registry-based dispatch
+            if name == "screen_process":
+                # Special handling for 2-frame capture
+                angle = args.get("angle", "screen").lower().strip()
+                user_query = args.get("text", "Analyze the image and answer briefly.")
+                print(f"[Vision] 📸 Capturing sequence for {angle}...")
+                
+                frames = []
+                for _ in range(2):
+                    try:
+                        if angle == "camera":
+                            from actions.screen_processor import _capture_camera
+                            p, m = _capture_camera()
+                        else:
+                            from actions.screen_processor import _capture_screen
+                            p, m = _capture_screen()
+                        if isinstance(p, bytes): frames.append(p)
+                    except Exception as e: print(f"[Vision] ⚠️ {e}")
+                    await asyncio.sleep(0.4)
 
-            elif name == "weather_report":
-                r = await loop.run_in_executor(None, lambda: weather_action(parameters=args, player=self.ui))
-                result = r or "Weather delivered."
+                if frames:
+                    for f_data in frames:
+                        await self.session.send_realtime_input(video=types.Blob(data=f_data, mime_type="image/jpeg"))
+                    await self.session.send_realtime_input(text=user_query)
+                    result = f"Video sequence sent. Analyzing {angle}..."
+                else:
+                    result = f"Failed to capture {angle}."
 
-            elif name == "browser_control":
-                r = await loop.run_in_executor(None, lambda: browser_control(parameters=args, player=self.ui))
+            elif name in self.TOOL_MAP:
+                handler = self.TOOL_MAP[name]
+                # Check if it needs extra params
+                if name in ["send_message"]:
+                    r = await loop.run_in_executor(None, lambda: handler(parameters=args, response=None, player=self.ui, session_memory=None))
+                elif name in ["code_helper", "dev_agent", "game_updater"]:
+                    r = await loop.run_in_executor(None, lambda: handler(parameters=args, player=self.ui, speak=self.speak))
+                else:
+                    r = await loop.run_in_executor(None, lambda: handler(parameters=args, player=self.ui))
                 result = r or "Done."
-
-            elif name == "file_controller":
-                r = await loop.run_in_executor(None, lambda: file_controller(parameters=args, player=self.ui))
-                result = r or "Done."
-
-            elif name == "send_message":
-                r = await loop.run_in_executor(None, lambda: send_message(parameters=args, response=None, player=self.ui, session_memory=None))
-                result = r or f"Message sent to {args.get('receiver')}."
-
-            elif name == "reminder":
-                r = await loop.run_in_executor(None, lambda: reminder(parameters=args, response=None, player=self.ui))
-                result = r or "Reminder set."
-
-            elif name == "youtube_video":
-                r = await loop.run_in_executor(None, lambda: youtube_video(parameters=args, response=None, player=self.ui))
-                result = r or "Done."
-
-            elif name == "screen_process":
-                threading.Thread(
-                    target=screen_process,
-                    kwargs={"parameters": args, "response": None,
-                            "player": self.ui, "session_memory": None},
-                    daemon=True
-                ).start()
-                result = "Vision module activated. Stay completely silent — vision module will speak directly."
-
-            elif name == "computer_settings":
-                r = await loop.run_in_executor(None, lambda: computer_settings(parameters=args, response=None, player=self.ui))
-                result = r or "Done."
-
-            elif name == "desktop_control":
-                r = await loop.run_in_executor(None, lambda: desktop_control(parameters=args, player=self.ui))
-                result = r or "Done."
-
-            elif name == "code_helper":
-                r = await loop.run_in_executor(None, lambda: code_helper(parameters=args, player=self.ui, speak=self.speak))
-                result = r or "Done."
-
-            elif name == "dev_agent":
-                r = await loop.run_in_executor(None, lambda: dev_agent(parameters=args, player=self.ui, speak=self.speak))
-                result = r or "Done."
-
-            elif name == "agent_task":
-                from agent.task_queue import get_queue, TaskPriority
-                priority_map = {"low": TaskPriority.LOW, "normal": TaskPriority.NORMAL, "high": TaskPriority.HIGH}
-                priority = priority_map.get(args.get("priority", "normal").lower(), TaskPriority.NORMAL)
-                task_id  = get_queue().submit(goal=args.get("goal", ""), priority=priority, speak=self.speak)
-                result   = f"Task started (ID: {task_id})."
-
-            elif name == "web_search":
-                r = await loop.run_in_executor(None, lambda: web_search_action(parameters=args, player=self.ui))
-                result = r or "Done."
-
-            elif name == "computer_control":
-                r = await loop.run_in_executor(None, lambda: computer_control(parameters=args, player=self.ui))
-                result = r or "Done."
-
-            elif name == "game_updater":
-                r = await loop.run_in_executor(None, lambda: game_updater(parameters=args, player=self.ui, speak=self.speak))
-                result = r or "Done."
-
-            elif name == "flight_finder":
-                r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
-                result = r or "Done."
-
-            elif name == "shutdown_jarvis":
-                self.ui.write_log("SYS: Shutdown requested.")
-                self.speak("Goodbye, sir.")
-                def _shutdown():
-                    import time, os
-                    time.sleep(1)
-                    os._exit(0)
-                threading.Thread(target=_shutdown, daemon=True).start()
-
             else:
                 result = f"Unknown tool: {name}"
 
@@ -635,7 +477,22 @@ class JarvisLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
-            await self.session.send_realtime_input(media=msg)
+            if "mime_type" in msg and msg["mime_type"].startswith("audio/"):
+                await self.session.send_realtime_input(
+                    audio=types.Blob(
+                        data=msg["data"], mime_type="audio/pcm;rate=16000"
+                    )
+                )
+            elif "mime_type" in msg and msg["mime_type"].startswith("image/"):
+                await self.session.send_realtime_input(
+                    video=types.Blob(
+                        data=msg["data"], mime_type=msg["mime_type"]
+                    )
+                )
+            elif "text" in msg:
+                await self.session.send_realtime_input(text=msg["text"])
+            else:
+                await self.session.send_realtime_input(media=msg)
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
@@ -646,10 +503,12 @@ class JarvisLive:
                 jarvis_speaking = self._is_speaking
             if not jarvis_speaking and not self.ui.muted:
                 data = indata.tobytes()
-                loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
-                )
+                def _safe_put():
+                    try:
+                        self.out_queue.put_nowait({"data": data, "mime_type": "audio/pcm"})
+                    except asyncio.QueueFull:
+                        pass
+                loop.call_soon_threadsafe(_safe_put)
 
         try:
             with sd.InputStream(
@@ -673,7 +532,7 @@ class JarvisLive:
         try:
             while True:
                 async for response in self.session.receive():
-
+                    
                     if response.data:
                         if self._turn_done_event and self._turn_done_event.is_set():
                             self._turn_done_event.clear()
@@ -686,49 +545,38 @@ class JarvisLive:
                             txt = _clean_transcript(sc.output_transcription.text)
                             if txt:
                                 out_buf.append(txt)
-
-                        if sc.input_transcription and sc.input_transcription.text:
-                            txt = _clean_transcript(sc.input_transcription.text)
-                            if txt:
-                                in_buf.append(txt)
-
+                        
+                        if sc.model_turn:
+                            for part in sc.model_turn.parts:
+                                if part.text:
+                                    in_buf.append(part.text)
+                        
                         if sc.turn_complete:
-                            if self._turn_done_event:
-                                self._turn_done_event.set()
-
-                            full_in = " ".join(in_buf).strip()
-                            if full_in:
-                                self.ui.write_log(f"You: {full_in}")
-                            in_buf = []
-
                             full_out = " ".join(out_buf).strip()
+                            full_in  = " ".join(in_buf).strip()
                             if full_out:
-                                self.ui.write_log(f"Jarvis: {full_out}")
-                            out_buf = []
+                                print(f"[You] {full_out}")
+                            if full_in:
+                                print(f"[Jarvis] {full_in}")
+                                self.ui.write_log(f"Jarvis: {full_in}")
+                            out_buf, in_buf = [], []
+                            self._turn_done_event.set()
 
                     if response.tool_call:
-                        fn_responses = []
                         for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
-                        await self.session.send_tool_response(
-                            function_responses=fn_responses
-                        )
+                            res = await self._execute_tool(fc)
+                            await self.session.send_tool_response(function_responses=[res])
 
         except Exception as e:
             print(f"[JARVIS] ❌ Recv: {e}")
             traceback.print_exc()
-            raise
 
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
-
         stream = sd.RawOutputStream(
             samplerate=RECEIVE_SAMPLE_RATE,
             channels=CHANNELS,
             dtype="int16",
-            blocksize=CHUNK_SIZE,
         )
         stream.start()
 
@@ -746,15 +594,13 @@ class JarvisLive:
                         and self.audio_in_queue.empty()
                     ):
                         self.set_speaking(False)
-                        self._turn_done_event.clear()
                     continue
 
                 self.set_speaking(True)
-                await asyncio.to_thread(stream.write, chunk)
+                stream.write(chunk)
 
         except Exception as e:
-            print(f"[JARVIS] ❌ Play: {e}")
-            raise
+            print(f"[JARVIS] 🔊 Play Error: {e}")
         finally:
             self.set_speaking(False)
             stream.stop()
@@ -763,28 +609,28 @@ class JarvisLive:
     async def run(self):
         client = genai.Client(
             api_key=_get_api_key(),
-            http_options={"api_version": "v1beta"}
+            http_options={"api_version": "v1alpha"}
         )
+        config = self._build_config()
 
+        backoff = 3
         while True:
             try:
                 print("[JARVIS] 🔌 Connecting...")
-                self.ui.set_state("THINKING")
-                config = self._build_config()
-
                 async with (
                     client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
-                    asyncio.TaskGroup() as tg,
+                    asyncio.TaskGroup() as tg
                 ):
                     self.session        = session
                     self._loop          = asyncio.get_event_loop()
                     self.audio_in_queue = asyncio.Queue()
-                    self.out_queue      = asyncio.Queue(maxsize=10)
+                    self.out_queue      = asyncio.Queue(maxsize=100)
                     self._turn_done_event = asyncio.Event()
 
                     print("[JARVIS] ✅ Connected.")
                     self.ui.set_state("LISTENING")
                     self.ui.write_log("SYS: JARVIS online.")
+                    backoff = 3
 
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
@@ -797,12 +643,13 @@ class JarvisLive:
 
             self.set_speaking(False)
             self.ui.set_state("THINKING")
-            print("[JARVIS] 🔄 Reconnecting in 3s...")
-            await asyncio.sleep(3)
-
+            print(f"[JARVIS] 🔄 Reconnecting in {int(backoff)}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.5, 60)
 
 def main():
-    ui = JarvisUI("face.png")
+    from ui import JarvisUI
+    ui = JarvisUI("logo.png")
 
     def runner():
         ui.wait_for_api_key()
@@ -815,6 +662,6 @@ def main():
     threading.Thread(target=runner, daemon=True).start()
     ui.root.mainloop()
 
-
 if __name__ == "__main__":
     main()
+

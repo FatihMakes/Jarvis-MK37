@@ -273,15 +273,26 @@ def _handle_steam_profile_selection() -> bool:
 def _find_best_drive() -> dict | None:
     import shutil, string
     drives = []
-    for letter in string.ascii_uppercase:
-        drive_path = f"{letter}:\\"
-        if os.path.exists(drive_path):
-            try:
-                free_gb = shutil.disk_usage(drive_path).free / (1024 ** 3)
-                if free_gb > 0:
-                    drives.append({"letter": letter, "path": drive_path, "free_gb": free_gb})
-            except Exception:
-                continue
+    if is_windows():
+        for letter in string.ascii_uppercase:
+            drive_path = f"{letter}:\\"
+            if os.path.exists(drive_path):
+                try:
+                    free_gb = shutil.disk_usage(drive_path).free / (1024 ** 3)
+                    if free_gb > 0:
+                        drives.append({"letter": letter, "path": drive_path, "free_gb": free_gb})
+                except Exception:
+                    continue
+    else:
+        # Linux/macOS standard mount points
+        for mount in ["/", "/home", "/mnt", "/media"]:
+            if os.path.exists(mount):
+                try:
+                    free_gb = shutil.disk_usage(mount).free / (1024 ** 3)
+                    if free_gb > 0:
+                        drives.append({"letter": mount, "path": mount, "free_gb": free_gb})
+                except Exception:
+                    continue
     return max(drives, key=lambda d: d["free_gb"]) if drives else None
 
 

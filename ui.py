@@ -1,4 +1,4 @@
-import os, json, time, math, random, threading, platform
+import os, json, time, math, random, threading, platform, queue
 import tkinter as tk
 from collections import deque
 from PIL import Image, ImageTk, ImageDraw
@@ -73,6 +73,8 @@ class JarvisUI:
         self.typing_queue = deque()
         self.is_typing    = False
 
+        self._ui_queue = queue.Queue()
+
         self.on_text_command = None
 
         self._face_pil         = None
@@ -107,13 +109,25 @@ class JarvisUI:
         self._build_mute_button()
 
         self.root.bind("<F4>", lambda e: self._toggle_mute())
-
         self._api_key_ready = self._api_keys_exist()
         if not self._api_key_ready:
             self._show_setup_ui()
 
         self._animate()
+        self._poll_ui_queue()
         self.root.protocol("WM_DELETE_WINDOW", lambda: os._exit(0))
+
+    def _poll_ui_queue(self):
+        try:
+            while True:
+                cmd, args = self._ui_queue.get_nowait()
+                if cmd == "set_state":
+                    self._set_state_sync(*args)
+                elif cmd == "write_log":
+                    self._write_log_sync(*args)
+        except queue.Empty:
+            pass
+        self.root.after(50, self._poll_ui_queue)
 
     def _build_mute_button(self):
         BTN_W, BTN_H = 110, 32
@@ -207,6 +221,9 @@ class JarvisUI:
             ).start()
 
     def set_state(self, state: str):
+        self._ui_queue.put(("set_state", (state,)))
+
+    def _set_state_sync(self, state: str):
         self._jarvis_state = state
         if state == "MUTED":
             self.status_text = "MUTED"
@@ -468,12 +485,15 @@ class JarvisUI:
                       text="FatihMakes Industries  ·  CLASSIFIED  ·  MARK XXXVII")
 
     def write_log(self, text: str):
+        self._ui_queue.put(("write_log", (text,)))
+
+    def _write_log_sync(self, text: str):
         self.typing_queue.append(text)
         tl = text.lower()
         if tl.startswith("you:"):
-            self.set_state("PROCESSING")
+            self._set_state_sync("PROCESSING")
         elif tl.startswith("jarvis:") or tl.startswith("ai:"):
-            self.set_state("SPEAKING")
+            self._set_state_sync("SPEAKING")
         if not self.is_typing:
             self._start_typing()
 
@@ -685,4 +705,4 @@ class JarvisUI:
         self.setup_frame.destroy()
         self._api_key_ready = True
         self.set_state("LISTENING")
-        self.write_log(f"SYS: Systems initialised. OS → {os_system.upper()}. JARVIS online.")
+        self.write_log(f"SYS: Systems initialised. OS -> {os_system.upper()}. JARVIS online.")

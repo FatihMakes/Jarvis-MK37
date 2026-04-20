@@ -11,7 +11,7 @@ from datetime import datetime
 try:
     import pyautogui
     _PYAUTOGUI = True
-except ImportError:
+except Exception:
     _PYAUTOGUI = False
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
@@ -73,7 +73,7 @@ def _build_sandbox() -> dict:
                 "QueryValueEx": winreg.QueryValueEx,
                 "HKEY_CURRENT_USER": winreg.HKEY_CURRENT_USER,
             })()
-        except ImportError:
+        except Exception:
             pass
 
     return sandbox
@@ -167,7 +167,7 @@ def set_wallpaper(image_path: str) -> str:
                     bmp_path = Path(tempfile.mktemp(suffix=".bmp"))
                     Image.open(path).convert("RGB").save(bmp_path, "BMP")
                     path = bmp_path
-                except ImportError:
+                except Exception:
                     pass 
             ctypes.windll.user32.SystemParametersInfoW(20, 0, str(path), 3)
             return f"Wallpaper set: {path.name}"
