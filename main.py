@@ -30,6 +30,7 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
+from actions.website_builder   import website_builder
 
 
 def get_base_dir():
@@ -38,14 +39,74 @@ def get_base_dir():
     return Path(__file__).resolve().parent
 
 
+# ── Task queue helpers ─────────────────────────────────────────────────────────
+def _load_tasks() -> list:
+    try:
+        p = get_base_dir() / "memory" / "pending_tasks.json"
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return []
+
+def _save_tasks(tasks: list):
+    p = get_base_dir() / "memory" / "pending_tasks.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(tasks, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def _handle_task_queue(args: dict) -> str:
+    import time as _t
+    action = args.get("action", "list").lower()
+    tasks  = _load_tasks()
+
+    if action == "add":
+        task = args.get("task", "").strip()
+        if not task:
+            return "No task provided."
+        tasks.append({"id": int(_t.time() * 1000) % 100000, "task": task, "done": False})
+        _save_tasks(tasks)
+        pending = [t for t in tasks if not t["done"]]
+        return f"Task added. {len(pending)} pending task(s) total."
+
+    elif action == "list":
+        pending = [t for t in tasks if not t["done"]]
+        if not pending:
+            return "No pending tasks."
+        lines = [f"#{t['id']}: {t['task']}" for t in pending]
+        return "Pending tasks:\n" + "\n".join(lines)
+
+    elif action == "done":
+        ref = args.get("task", "").strip().lower()
+        matched = False
+        for t in tasks:
+            if not t["done"] and (ref in t["task"].lower() or ref == str(t["id"])):
+                t["done"] = True
+                matched = True
+                break
+        _save_tasks(tasks)
+        if matched:
+            remaining = len([t for t in tasks if not t["done"]])
+            return f"Task marked done. {remaining} task(s) remaining."
+        return "No matching task found."
+
+    elif action == "clear":
+        _save_tasks([])
+        return "Task list cleared."
+
+    return f"Unknown action: {action}"
+
+
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-latest"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE          = 1024
+CHUNK_SIZE          = 4096
+WAKE_SIGNAL         = BASE_DIR / ".wake_signal"
+TASKS_FILE          = BASE_DIR / "memory" / "pending_tasks.json"
+PASSIVE_TIMEOUT     = 60.0   # seconds of user silence before passive mode
 
 
 def _get_api_key() -> str:
@@ -58,7 +119,8 @@ def _load_system_prompt() -> str:
         return PROMPT_PATH.read_text(encoding="utf-8")
     except Exception:
         return (
-            "You are JARVIS, Tony Stark's AI assistant. "
+            "You are A.L.I, the personal AI assistant of Ali. "
+            "Always refer to the user as Ali. Never call yourself anything other than A.L.I. "
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
         )
@@ -379,7 +441,7 @@ TOOL_DECLARATIONS = [
         "description": (
             "Shuts down the assistant completely. "
             "Call this when the user expresses intent to end the conversation, "
-            "close the assistant, say goodbye, or stop Jarvis. "
+            "close the assistant, say goodbye, or stop Ali. "
             "The user can say this in ANY language."
         ),
         "parameters": {
@@ -417,25 +479,104 @@ TOOL_DECLARATIONS = [
             "required": ["category", "key", "value"]
         }
     },
+    {
+        "name": "show_build_log",
+        "description": (
+            "Shows the live progress log of the most recent website build. "
+            "Call this when user asks 'what are you doing?', 'show me your progress', "
+            "'what did you build?', or 'show the build log'. "
+            "Reads the build_log.txt from the last website project."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {}}
+    },
+    {
+        "name": "task_queue",
+        "description": (
+            "Manages a persistent task list. Use this to stay organised when given "
+            "multiple tasks. Actions: 'add' a task, 'list' all pending tasks, "
+            "'done' to mark a task complete, 'clear' to remove all. "
+            "When given multiple tasks at once, add all of them first, then execute "
+            "one by one and mark each done as you finish."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "add | list | done | clear"
+                },
+                "task": {
+                    "type": "STRING",
+                    "description": "Task description (for 'add') or task ID / partial description (for 'done')"
+                },
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "build_website",
+        "description": (
+            "Researches design inspiration, then builds a complete HTML/CSS/JS website "
+            "and opens it in the browser. Use when user asks to build, create, or design "
+            "a website, landing page, portfolio, or any web project. "
+            "Researches AWWWARDS-style trends, generates beautiful SEO-optimised pages, "
+            "serves locally, and auto-opens in browser."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "topic": {
+                    "type": "STRING",
+                    "description": "What the website is about, e.g. 'luxury watch brand', 'photographer portfolio', 'SaaS startup'"
+                },
+                "style": {
+                    "type": "STRING",
+                    "description": "Visual style, e.g. 'dark minimalist', 'bold colorful', 'glassmorphism', 'brutalist'"
+                },
+                "pages": {
+                    "type": "STRING",
+                    "description": "Comma-separated page names, e.g. 'index, about, contact'. Default: index only."
+                },
+                "variant": {
+                    "type": "STRING",
+                    "description": (
+                        "Force a specific layout variant: cinematic | editorial | brutalist | "
+                        "kinetic | luxury_minimal | immersive_dark. "
+                        "Omit to pick randomly — every build gets a different layout."
+                    )
+                },
+            },
+            "required": ["topic"]
+        }
+    },
 ]
 
 
 class JarvisLive:
 
     def __init__(self, ui: JarvisUI):
-        self.ui             = ui
-        self.session        = None
-        self.audio_in_queue = None
-        self.out_queue      = None
-        self._loop          = None
-        self._is_speaking   = False
-        self._speaking_lock = threading.Lock()
+        import time as _t
+        self.ui                = ui
+        self.session           = None
+        self.audio_in_queue    = None
+        self.out_queue         = None
+        self._loop             = None
+        self._is_speaking      = False
+        self._speaking_lock    = threading.Lock()
+        self._passive_mode     = False
+        self._passive_lock     = threading.Lock()
+        self._last_user_speech = _t.time()
         self.ui.on_text_command = self._on_text_command
         self._turn_done_event: asyncio.Event | None = None
 
     def _on_text_command(self, text: str):
+        import time as _t
         if not self._loop or not self.session:
             return
+        # Text input always exits passive mode
+        with self._passive_lock:
+            self._passive_mode = False
+            self._last_user_speech = _t.time()
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"parts": [{"text": text}]},
@@ -508,7 +649,7 @@ class JarvisLive:
         name = fc.name
         args = dict(fc.args or {})
 
-        print(f"[JARVIS] 🔧 {name}  {args}")
+        print(f"[ALI] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
 
         # ── save_memory: sessiz ve hızlı ──────────────────────────────────────
@@ -606,6 +747,23 @@ class JarvisLive:
                 r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
                 result = r or "Done."
 
+            elif name == "show_build_log":
+                sites_dir = Path.home() / "Desktop" / "ali_sites"
+                log_text = "No build log found yet."
+                if sites_dir.exists():
+                    logs = sorted(sites_dir.glob("*/build_log.txt"),
+                                  key=lambda p: p.stat().st_mtime, reverse=True)
+                    if logs:
+                        log_text = logs[0].read_text(encoding="utf-8")[-3000:]
+                result = log_text
+
+            elif name == "task_queue":
+                result = await loop.run_in_executor(None, lambda: _handle_task_queue(args))
+
+            elif name == "build_website":
+                r = await loop.run_in_executor(None, lambda: website_builder(parameters=args, player=self.ui, speak=self.speak))
+                result = r or "Website built."
+
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 self.speak("Goodbye, sir.")
@@ -626,7 +784,7 @@ class JarvisLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-        print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
+        print(f"[ALI] 📤 {name} → {str(result)[:80]}")
         return types.FunctionResponse(
             id=fc.id, name=name,
             response={"result": result}
@@ -638,13 +796,50 @@ class JarvisLive:
             await self.session.send_realtime_input(media=msg)
 
     async def _listen_audio(self):
-        print("[JARVIS] 🎤 Mic started")
+        import time as _t
+        import numpy as np
+        print("[ALI] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
+        # RMS threshold for "someone is speaking" in int16 space (0-32767)
+        # ~0.015 normalized = ~500 int16 RMS — clear speech, above background hum
+        SPEECH_RMS = 500.0
+
         def callback(indata, frames, time_info, status):
+            now = _t.time()
+
+            # Check wake signal file (written by wakeword.py)
+            if WAKE_SIGNAL.exists():
+                try:
+                    WAKE_SIGNAL.unlink()
+                except Exception:
+                    pass
+                with self._passive_lock:
+                    self._passive_mode = False
+                    self._last_user_speech = now
+                self.ui.write_log("SYS: Woke from passive — listening")
+                self.ui.set_state("LISTENING")
+
+            # Compute energy to track user silence for auto-passive
+            chunk = indata[:, 0] if indata.ndim > 1 else indata.flatten()
+            rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+            if rms > SPEECH_RMS:
+                with self._passive_lock:
+                    self._last_user_speech = now
+
+            # Auto passive: if user hasn't spoken for PASSIVE_TIMEOUT seconds
+            with self._passive_lock:
+                idle = now - self._last_user_speech
+                if not self._passive_mode and idle > PASSIVE_TIMEOUT:
+                    self._passive_mode = True
+                    self.ui.write_log("SYS: Passive mode — say 'Hey Ali' to wake")
+                    self.ui.set_state("LISTENING")
+                passive = self._passive_mode
+
             with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted:
+                ali_speaking = self._is_speaking
+
+            if not passive and not ali_speaking and not self.ui.muted:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
@@ -659,15 +854,15 @@ class JarvisLive:
                 blocksize=CHUNK_SIZE,
                 callback=callback,
             ):
-                print("[JARVIS] 🎤 Mic stream open")
+                print("[ALI] 🎤 Mic stream open")
                 while True:
                     await asyncio.sleep(0.1)
         except Exception as e:
-            print(f"[JARVIS] ❌ Mic: {e}")
+            print(f"[ALI] ❌ Mic: {e}")
             raise
 
     async def _receive_audio(self):
-        print("[JARVIS] 👂 Recv started")
+        print("[ALI] 👂 Recv started")
         out_buf, in_buf = [], []
 
         try:
@@ -688,9 +883,14 @@ class JarvisLive:
                                 out_buf.append(txt)
 
                         if sc.input_transcription and sc.input_transcription.text:
+                            import time as _t
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
                                 in_buf.append(txt)
+                                # User spoke — reset passive timeout
+                                with self._passive_lock:
+                                    self._last_user_speech = _t.time()
+                                    self._passive_mode = False
 
                         if sc.turn_complete:
                             if self._turn_done_event:
@@ -703,13 +903,13 @@ class JarvisLive:
 
                             full_out = " ".join(out_buf).strip()
                             if full_out:
-                                self.ui.write_log(f"Jarvis: {full_out}")
+                                self.ui.write_log(f"Ali: {full_out}")
                             out_buf = []
 
                     if response.tool_call:
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] 📞 {fc.name}")
+                            print(f"[ALI] 📞 {fc.name}")
                             fr = await self._execute_tool(fc)
                             fn_responses.append(fr)
                         await self.session.send_tool_response(
@@ -717,29 +917,47 @@ class JarvisLive:
                         )
 
         except Exception as e:
-            print(f"[JARVIS] ❌ Recv: {e}")
+            print(f"[ALI] ❌ Recv: {e}")
             traceback.print_exc()
             raise
 
     async def _play_audio(self):
-        print("[JARVIS] 🔊 Play started")
+        print("[ALI] 🔊 Play started")
 
         stream = sd.RawOutputStream(
             samplerate=RECEIVE_SAMPLE_RATE,
             channels=CHANNELS,
             dtype="int16",
             blocksize=CHUNK_SIZE,
+            latency="low",
         )
         stream.start()
+
+        # Pre-buffer: collect a few chunks before playing to avoid gaps
+        PREBUFFER = 3
+        buf = []
 
         try:
             while True:
                 try:
                     chunk = await asyncio.wait_for(
                         self.audio_in_queue.get(),
-                        timeout=0.1
+                        timeout=0.15
                     )
+                    buf.append(chunk)
+                    # Play once we have enough buffered or queue is draining
+                    if len(buf) >= PREBUFFER or not self.audio_in_queue.empty():
+                        self.set_speaking(True)
+                        for c in buf:
+                            await asyncio.to_thread(stream.write, c)
+                        buf = []
                 except asyncio.TimeoutError:
+                    # Flush remaining buffer
+                    if buf:
+                        self.set_speaking(True)
+                        for c in buf:
+                            await asyncio.to_thread(stream.write, c)
+                        buf = []
                     if (
                         self._turn_done_event
                         and self._turn_done_event.is_set()
@@ -749,11 +967,8 @@ class JarvisLive:
                         self._turn_done_event.clear()
                     continue
 
-                self.set_speaking(True)
-                await asyncio.to_thread(stream.write, chunk)
-
         except Exception as e:
-            print(f"[JARVIS] ❌ Play: {e}")
+            print(f"[ALI] ❌ Play: {e}")
             raise
         finally:
             self.set_speaking(False)
@@ -768,7 +983,7 @@ class JarvisLive:
 
         while True:
             try:
-                print("[JARVIS] 🔌 Connecting...")
+                print("[ALI] 🔌 Connecting...")
                 self.ui.set_state("THINKING")
                 config = self._build_config()
 
@@ -782,9 +997,9 @@ class JarvisLive:
                     self.out_queue      = asyncio.Queue(maxsize=10)
                     self._turn_done_event = asyncio.Event()
 
-                    print("[JARVIS] ✅ Connected.")
+                    print("[ALI] ✅ Connected.")
                     self.ui.set_state("LISTENING")
-                    self.ui.write_log("SYS: JARVIS online.")
+                    self.ui.write_log("SYS: ALI online.")
 
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
@@ -792,12 +1007,12 @@ class JarvisLive:
                     tg.create_task(self._play_audio())
 
             except Exception as e:
-                print(f"[JARVIS] ⚠️ {e}")
+                print(f"[ALI] ⚠️ {e}")
                 traceback.print_exc()
 
             self.set_speaking(False)
             self.ui.set_state("THINKING")
-            print("[JARVIS] 🔄 Reconnecting in 3s...")
+            print("[ALI] 🔄 Reconnecting in 3s...")
             await asyncio.sleep(3)
 
 

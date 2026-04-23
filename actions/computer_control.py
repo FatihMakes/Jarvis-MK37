@@ -75,7 +75,7 @@ _LAST_NAMES = [
     "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller",
     "Davis", "Wilson", "Moore", "Taylor", "Anderson", "Thomas", "Jackson",
 ]
-_DOMAINS = ["gmail.com", "yahoo.com", "outlook.com", "proton.me", "mail.com"]
+_DOMAINS = ["mail.com", "proton.me", "outlook.com", "icloud.com", "yahoo.com"]
 
 
 def _random_data(data_type: str) -> str:

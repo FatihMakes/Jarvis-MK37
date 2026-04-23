@@ -1,0 +1,30 @@
+# ── Personal data — NEVER commit these ───────────────────────────────────────
+config/api_keys.json
+memory/long_term.json
+memory/pending_tasks.json
+memory/*.json
+.wake_signal
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Logs / temp ───────────────────────────────────────────────────────────────
+*.log
+/tmp/
+ali_sites/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,26 @@
+[project]
+name = "jarvis-mk37"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "duckduckgo-search>=8.1.1",
+    "google-genai>=1.73.1",
+    "google-generativeai>=0.8.6",
+    "mss>=10.2.0",
+    "numpy>=2.4.4",
+    "opencv-python>=4.13.0.92",
+    "pillow>=12.2.0",
+    "playwright>=1.58.0",
+    "psutil>=7.2.2",
+    "pyautogui>=0.9.54",
+    "pygetwindow>=0.0.9",
+    "pyperclip>=1.11.0",
+    "requests>=2.33.1",
+    "send2trash>=2.1.0",
+    "sounddevice>=0.5.5",
+    "speechrecognition>=3.16.0",
+    "youtube-transcript-api>=1.2.4",
+]

@@ -420,6 +420,60 @@ def open_run():
     if _OS == "Windows":
         pyautogui.hotkey("win", "r")
 
+def connect_bluetooth(device_name: str = ""):
+    if _OS == "Darwin":
+        # Try blueutil first (fastest)
+        blueutil = subprocess.run(["which", "blueutil"], capture_output=True, text=True).stdout.strip()
+        if blueutil:
+            # Find device and connect
+            result = subprocess.run([blueutil, "--paired", "--format", "json"],
+                                    capture_output=True, text=True)
+            try:
+                import json as _json
+                devices = _json.loads(result.stdout)
+                for dev in devices:
+                    name = dev.get("name", "")
+                    if not device_name or device_name.lower() in name.lower():
+                        addr = dev.get("address", "")
+                        subprocess.run([blueutil, "--connect", addr], capture_output=True)
+                        return f"Connected to {name}."
+            except Exception:
+                pass
+
+        # Fallback: open Bluetooth settings so user can connect
+        script = '''
+tell application "System Settings"
+    activate
+end tell
+delay 0.5
+open location "x-apple.systempreferences:com.apple.preferences.Bluetooth"
+'''
+        subprocess.run(["osascript", "-e", script], capture_output=True)
+        return "Opened Bluetooth settings. Click your AirPods to connect."
+    else:
+        return "Bluetooth control is only supported on macOS."
+
+def list_bluetooth_devices():
+    if _OS == "Darwin":
+        result = subprocess.run(
+            ["system_profiler", "SPBluetoothDataType", "-json"],
+            capture_output=True, text=True, timeout=8
+        )
+        try:
+            import json as _json
+            data = _json.loads(result.stdout)
+            items = []
+            bt = data.get("SPBluetoothDataType", [{}])[0]
+            for key in ("device_connected", "device_not_connected"):
+                for dev in bt.get(key, []):
+                    for name, info in dev.items():
+                        state = "connected" if key == "device_connected" else "not connected"
+                        items.append(f"{name} ({state})")
+            return "\n".join(items) if items else "No Bluetooth devices found."
+        except Exception as e:
+            return f"Could not list devices: {e}"
+    return "Not supported on this OS."
+
 def dark_mode():
     if _OS == "Darwin":
         subprocess.run(["osascript", "-e",
@@ -561,6 +615,11 @@ ACTION_MAP: dict[str, callable] = {
     "toggle_wifi":         toggle_wifi,
     "restart":             restart_computer,
     "shutdown":            shutdown_computer,
+    "connect_bluetooth":   connect_bluetooth,
+    "connect_airpods":     connect_bluetooth,
+    "bluetooth_connect":   connect_bluetooth,
+    "list_bluetooth":      list_bluetooth_devices,
+    "bluetooth_devices":   list_bluetooth_devices,
 }
 
 _DANGEROUS_ACTIONS = {"restart", "shutdown"}
@@ -681,6 +740,12 @@ def computer_settings(
         return f"Unknown action: '{raw_action}'."
 
     try:
+        if action in ("connect_bluetooth", "connect_airpods", "bluetooth_connect"):
+            device = str(value or params.get("device", "") or params.get("device_name", "")).strip()
+            result = func(device)
+            return result or f"Done: {action}."
+        if action in ("list_bluetooth", "bluetooth_devices"):
+            return func()
         func()
         return f"Done: {action}."
     except Exception as e:
