@@ -1,7 +1,7 @@
 # 🤖 MARK XXXVII (37)
 ### The Ultimate Cross-Platform Personal AI Assistant — By FatihMakes
 
-> 📺 **[Watch the full setup video on YouTube](https://www.youtube.com/watch?v=BhOsnGC_sAA)**
+> 📺 **[Watch the full setup video on YouTube](https://youtu.be/3dqgUsonmn8?si=eh_McOF5V8bduTo1)**
 
 A real-time voice AI that can hear, see, understand, and control your computer — on any OS. Supporting Windows, macOS, and Linux. Local execution. Zero subscriptions. Engineered for total autonomy.
 
