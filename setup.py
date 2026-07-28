@@ -15,12 +15,11 @@ if platform.system() == "Windows":
     except ImportError:
         postinstall = Path(sys.executable).parent / "Scripts" / "pywin32_postinstall.py"
         print(
-            "\n⚠️  pywin32 did not install correctly — desktop shortcut creation "
+            "\nWARNING: pywin32 did not install correctly. Desktop shortcut creation "
             "will fall back to a slower method that may not work on this machine.\n"
             "    Try fixing it manually with:\n"
             f'    "{sys.executable}" -m pip install --force-reinstall pywin32\n'
             f'    "{sys.executable}" "{postinstall}" -install\n'
         )
 
-print("\n✅ Setup complete! Run 'python main.py' to start MARK L.")
-
+print("\nSetup complete! Run 'python main.py' to start MARK L.")
