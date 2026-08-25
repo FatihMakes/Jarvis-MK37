@@ -22,7 +22,7 @@ _CORE: list[tuple[str, str]] = [
     ("numpy",              "numpy"),
     ("requests",           "requests"),
     ("bs4",                "beautifulsoup4"),
-    ("duckduckgo_search",  "duckduckgo-search"),
+    ("ddgs",               "ddgs"),
     ("pyautogui",          "pyautogui"),
     ("pyperclip",          "pyperclip"),
     ("pygetwindow",        "pygetwindow"),
