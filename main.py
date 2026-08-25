@@ -1,5 +1,18 @@
 import platform as _platform
 import subprocess as _subprocess
+import sys as _sys
+
+# ── Make stdout/stderr UTF-8 tolerant ────────────────────────────────────────
+# On non-UTF-8 Windows consoles (cp1254/cp1252/cp936...) any print() containing
+# an emoji raises UnicodeEncodeError.  Several of those prints sit inside except
+# handlers, so the handler itself would blow up and skip the recovery code that
+# follows it — turning a recoverable error into a silent hang.  errors="replace"
+# makes every print safe.
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass   # frozen builds may have no real stream attached
 
 # ── Nuclear: force CREATE_NO_WINDOW on EVERY subprocess call on Windows ───────
 # This patches Popen itself, so no per-file flag is needed anywhere.
@@ -1231,14 +1244,18 @@ class JarvisLive:
                     await asyncio.sleep(1.0)
 
                 try:
-                    news_text = await asyncio.wait_for(news_done, timeout=4.0)
-                except Exception:
+                    news_text = await asyncio.wait_for(news_done, timeout=8.0)
+                except Exception as e:
+                    self.ui.write_log(f"SYS: News fetch timed out/failed: {e!r}")
                     news_text = ""
 
                 if not self.session:
                     return
 
-                if news_text and len(news_text) > 60:
+                failed = (not news_text) or news_text.startswith(
+                    ("No news found", "Search failed", "Please provide")
+                )
+                if not failed:
                     # Show on UI content panel immediately
                     self.ui.show_content("NEWS — top world news today", news_text)
 
@@ -1248,6 +1265,9 @@ class JarvisLive:
                         f"is displayed on screen. Do not call any tools.{lang_str}"
                     )
                 else:
+                    self.ui.write_log(
+                        f"SYS: News unavailable — backend returned: {news_text[:120]!r}"
+                    )
                     p2 = (
                         "News headlines could not be fetched right now. "
                         f"Let the user know briefly.{lang_str}"
