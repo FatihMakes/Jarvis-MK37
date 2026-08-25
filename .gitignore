@@ -1,0 +1,24 @@
+# ── Secrets — never commit ───────────────────────────────────────────────
+config/api_keys.json
+config/certs/
+*.pem
+*.key
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── Runtime state ────────────────────────────────────────────────────────
+memory/*.json
+*.log
+
+# ── Editor / OS ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.bak
