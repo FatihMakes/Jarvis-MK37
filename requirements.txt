@@ -5,7 +5,7 @@ google-generativeai
 pillow
 requests
 beautifulsoup4
-duckduckgo-search
+ddgs>=9.0.0
 playwright
 pyautogui
 pyperclip
