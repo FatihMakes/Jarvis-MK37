@@ -721,7 +721,7 @@ class JarvisLive:
         _addr = (f"ADDRESS: Always call the user '{_user_name}'."
                  if _user_name
                  else "ADDRESS: When speaking Turkish → always say \"efendim\". "
-                      "When speaking English → say \"sir\". Never mix languages.")
+                      "When speaking English → say \"sir\". Never mix languages. Always respond in their language and use 'sir' word in their language. Never mix them like 'welcome efendim, how can I help?' ")
         identity_ctx = (
             f"[IDENTITY]\n"
             f"Your name is {self._asst_name}. "
