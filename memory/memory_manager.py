@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 from threading import Lock
 from pathlib import Path
@@ -15,7 +16,33 @@ BASE_DIR         = get_base_dir()
 MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
 _lock            = Lock()
 MAX_VALUE_LENGTH = 380
-MEMORY_MAX_CHARS = 2200
+
+# ── Why there are two very different numbers here ────────────────────────────
+#
+# There used to be one: MEMORY_MAX_CHARS = 2200, applied to the whole store. It
+# was a *storage* limit, and it existed only because the entire memory was
+# pasted into the system prompt on every connect — so growing the memory grew
+# every single request. When it filled, _trim_to_limit() deleted the oldest
+# entries and printed one line to a console nobody reads. A memory described as
+# "deeply remembers projects, preferences and personal context" was in practice
+# two pages long, and quietly forgot your sister's name after a few weeks.
+#
+# Storage and prompt budget are now separate concerns:
+#
+#   MEMORY_MAX_CHARS  — a runaway guard, not a feature limit. Nothing normal
+#                       reaches it; a bug writing in a loop does.
+#   PROMPT_CORE_CHARS — what actually rides in the system prompt every session.
+#                       Smaller than the old whole-memory dump, so sessions
+#                       start *faster* than before, not slower.
+#
+# Everything above the core stays on disk and is fetched on demand by the
+# recall_memory tool — see search_memory() and format_memory_for_prompt().
+MEMORY_MAX_CHARS  = 200_000
+PROMPT_CORE_CHARS = 900
+PROMPT_INDEX_CHARS = 420
+# Most entries any one category may contribute to the core block, so a person
+# with forty stored preferences still gets their sister into the prompt.
+PROMPT_MAX_PER_CATEGORY = 6
 
 def _empty_memory() -> dict:
     return {
@@ -55,16 +82,37 @@ def _all_entries(memory: dict) -> list[tuple]:
     return entries
 
 
+# Set by main.py so a trim can reach the activity log. Deleting something a
+# person told you and mentioning it only on stdout is how a memory loses trust.
+_trim_notifier = None
+
+
+def set_trim_notifier(fn) -> None:
+    """Register a callable(str) that surfaces trims to the user."""
+    global _trim_notifier
+    _trim_notifier = fn
+
+
 def _trim_to_limit(memory: dict) -> dict:
     if len(json.dumps(memory, ensure_ascii=False)) <= MEMORY_MAX_CHARS:
         return memory
     entries = _all_entries(memory)
     entries.sort(key=lambda t: t[2].get("updated", "0000-00-00"))
+    dropped = []
     for cat, key, _ in entries:
         if len(json.dumps(memory, ensure_ascii=False)) <= MEMORY_MAX_CHARS:
             break
         del memory[cat][key]
+        dropped.append(f"{cat}/{key}")
         print(f"[Memory] 🗑️  Trimmed {cat}/{key}")
+    if dropped and _trim_notifier:
+        try:
+            _trim_notifier(
+                f"SYS: Memory full — forgot {len(dropped)} oldest entries "
+                f"({', '.join(dropped[:3])}{'…' if len(dropped) > 3 else ''})"
+            )
+        except Exception:
+            pass
     return memory
 
 def save_memory(memory: dict) -> None:
@@ -117,81 +165,241 @@ def update_memory(memory_update: dict) -> dict:
         print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
     return memory
 
+def _entry_value(entry) -> str:
+    """Accept both the {'value': ..., 'updated': ...} shape and a bare string,
+    because early versions of the store wrote plain strings."""
+    if isinstance(entry, dict):
+        return str(entry.get("value", "") or "").strip()
+    return str(entry or "").strip()
+
+
+def _pretty(key: str) -> str:
+    return key.replace("_", " ").strip()
+
+
+# Identity is always in the prompt; these categories compete for the remaining
+# budget by recency.
+_CATEGORY_LABELS = {
+    "preferences":   "Preferences",
+    "projects":      "Active projects / goals",
+    "relationships": "People in their life",
+    "wishes":        "Wishes / plans",
+    "notes":         "Notes",
+}
+
+_IDENTITY_FIELDS = ["name", "age", "birthday", "city", "job",
+                    "language", "school", "nationality"]
+
+
 def format_memory_for_prompt(memory: dict | None) -> str:
+    """Build the memory block that goes into the system prompt.
+
+    This used to dump everything. It now sends three things:
+
+      1. IDENTITY  - always, in full. It is small, and it is wrong for the
+         assistant to have to look up your name.
+      2. RECENT    - the most recently updated entries from every other
+         category, up to PROMPT_CORE_CHARS. Recency is the cheapest useful
+         relevance signal available without embeddings.
+      3. AN INDEX  - the *keys* of everything else, values omitted.
+
+    Point 3 is what makes recall work at all. A model cannot decide to look
+    something up if it does not know the thing exists: with only points 1 and 2,
+    "who is Ayse?" would get "I don't know" while ayse_sister sat on disk
+    unread. The index costs a few hundred characters and turns recall from a
+    gamble into a lookup.
+
+    Net effect on latency: this block is SMALLER than the old full dump, so
+    every session connects with fewer tokens. Occasionally the model spends one
+    extra round trip on recall_memory - covered by the acknowledgment it
+    already speaks before any slow step."""
     if not memory:
         return ""
 
-    lines = []
+    core_lines: list[str] = []
 
-    identity  = memory.get("identity", {})
-    id_fields = ["name", "age", "birthday", "city", "job", "language", "school", "nationality"]
-    for field in id_fields:
-        entry = identity.get(field)
-        if entry:
-            val = entry.get("value") if isinstance(entry, dict) else entry
-            if val:
-                lines.append(f"{field.title()}: {val}")
-    for key, entry in identity.items():
-        if key in id_fields:
+    # 1. Identity - always, in full
+    identity = memory.get("identity", {}) or {}
+    for field in _IDENTITY_FIELDS:
+        val = _entry_value(identity.get(field))
+        if not val:
             continue
-        val = entry.get("value") if isinstance(entry, dict) else entry
+        if field == "language":
+            # Labelled as an observation, not a setting. A bare "Language:
+            # English" line written months ago reads like a standing order and
+            # was one of the reasons a Turkish question came back in English.
+            core_lines.append(
+                f"Has spoken to you in: {val} (an observation about the past — "
+                f"always answer in the language of their CURRENT message)")
+        else:
+            core_lines.append(f"{field.title()}: {val}")
+    for key, entry in identity.items():
+        if key in _IDENTITY_FIELDS:
+            continue
+        val = _entry_value(entry)
         if val:
-            lines.append(f"{key.replace('_', ' ').title()}: {val}")
+            core_lines.append(f"{_pretty(key).title()}: {val}")
 
-    prefs = memory.get("preferences", {})
-    if prefs:
-        lines.append("")
-        lines.append("Preferences:")
-        for key, entry in list(prefs.items())[:15]:
-            val = entry.get("value") if isinstance(entry, dict) else entry
-            if val:
-                lines.append(f"  - {key.replace('_', ' ').title()}: {val}")
+    # 2. Everything else, most recently updated first
+    rest: list[tuple[str, str, str, str]] = []   # (updated, cat, key, value)
+    for cat in _CATEGORY_LABELS:
+        for key, entry in (memory.get(cat, {}) or {}).items():
+            val = _entry_value(entry)
+            if not val:
+                continue
+            updated = (entry.get("updated", "") if isinstance(entry, dict) else "") or "0000-00-00"
+            rest.append((updated, cat, key, val))
+    rest.sort(key=lambda t: t[0], reverse=True)
 
-    projects = memory.get("projects", {})
-    if projects:
-        lines.append("")
-        lines.append("Active Projects / Goals:")
-        for key, entry in list(projects.items())[:8]:
-            val = entry.get("value") if isinstance(entry, dict) else entry
-            if val:
-                lines.append(f"  - {key.replace('_', ' ').title()}: {val}")
+    used    = sum(len(l) + 1 for l in core_lines)
+    shown: dict[str, list[str]] = {}
+    overflow: dict[str, list[str]] = {}
 
-    rels = memory.get("relationships", {})
-    if rels:
-        lines.append("")
-        lines.append("People in their life:")
-        for key, entry in list(rels.items())[:10]:
-            val = entry.get("value") if isinstance(entry, dict) else entry
-            if val:
-                lines.append(f"  - {key.replace('_', ' ').title()}: {val}")
+    # Recency decides order, but no single category may take the whole budget.
+    # Without the cap, someone with forty stored preferences gets a prompt that
+    # is forty preferences and not one person's name — the categories that
+    # matter most in conversation are also the ones that change least often, so
+    # pure recency systematically buries them.
+    per_cat_used: dict[str, int] = {}
+    for _updated, cat, key, val in rest:
+        line = f"  - {_pretty(key).title()}: {val}"
+        if (per_cat_used.get(cat, 0) < PROMPT_MAX_PER_CATEGORY
+                and used + len(line) + 1 <= PROMPT_CORE_CHARS):
+            shown.setdefault(cat, []).append(line)
+            per_cat_used[cat] = per_cat_used.get(cat, 0) + 1
+            used += len(line) + 1
+        else:
+            overflow.setdefault(cat, []).append(_pretty(key))
 
-    wishes = memory.get("wishes", {})
-    if wishes:
-        lines.append("")
-        lines.append("Wishes / Plans / Wants:")
-        for key, entry in list(wishes.items())[:8]:
-            val = entry.get("value") if isinstance(entry, dict) else entry
-            if val:
-                lines.append(f"  - {key.replace('_', ' ').title()}: {val}")
+    # The index is a table of contents, so it is interleaved across categories
+    # rather than continuing in recency order. Sorted by recency it would list
+    # twenty-four preferences before the first relationship, and the one entry
+    # the index exists for — the old fact the model has no other way to know
+    # about — would fall off the end.
+    indexed: list[str] = []
+    if overflow:
+        cats  = [c for c in _CATEGORY_LABELS if overflow.get(c)]
+        cursor = {c: 0 for c in cats}
+        while cats:
+            for cat in list(cats):
+                i = cursor[cat]
+                if i >= len(overflow[cat]):
+                    cats.remove(cat)
+                    continue
+                indexed.append(overflow[cat][i])
+                cursor[cat] = i + 1
 
-    notes = memory.get("notes", {})
-    if notes:
-        lines.append("")
-        lines.append("Other notes:")
-        for key, entry in list(notes.items())[:8]:
-            val = entry.get("value") if isinstance(entry, dict) else entry
-            if val:
-                lines.append(f"  - {key}: {val}")
+    for cat, label in _CATEGORY_LABELS.items():
+        if shown.get(cat):
+            core_lines.append("")
+            core_lines.append(f"{label}:")
+            core_lines.extend(shown[cat])
 
-    if not lines:
+    if not core_lines and not indexed:
         return ""
 
-    header = "[WHAT YOU KNOW ABOUT THIS PERSON — use naturally, never recite like a list]\n"
-    result = header + "\n".join(lines)
-    if len(result) > 2000:
-        result = result[:1997] + "…"
+    out = [
+        "[WHAT YOU KNOW ABOUT THIS PERSON — use naturally, never recite like a list]",
+        *core_lines,
+    ]
 
-    return result + "\n"
+    # 3. The index of what is on disk but not in this prompt
+    if indexed:
+        budget, names = PROMPT_INDEX_CHARS, []
+        for n in indexed:
+            if budget - len(n) - 2 < 0:
+                break
+            names.append(n)
+            budget -= len(n) + 2
+        if names:
+            out.append("")
+            out.append(
+                "[ALSO REMEMBERED — values not shown here. Call recall_memory "
+                "with a keyword to read any of these before saying you do not know]"
+            )
+            out.append(", ".join(names)
+                       + (f" (+{len(indexed) - len(names)} more)"
+                          if len(indexed) > len(names) else ""))
+
+    return "\n".join(out) + "\n"
+
+
+# ── Recall ────────────────────────────────────────────────────────────────────
+
+def _score(query_words: list[str], cat: str, key: str, value: str) -> int:
+    """Cheap lexical relevance. No embeddings, no network, no model call - this
+    runs in well under a millisecond, which is the entire point: recall must
+    cost one model round trip, never two."""
+    hay_key = _pretty(key).lower()
+    hay_val = value.lower()
+    score   = 0
+    for w in query_words:
+        if not w:
+            continue
+        if w == hay_key:
+            score += 10
+        elif w in hay_key:
+            score += 6
+        if w in hay_val:
+            score += 3
+        if w in cat:
+            score += 1
+    return score
+
+
+def search_memory(query: str, limit: int = 8) -> str:
+    """Find stored facts matching `query`. Backs the recall_memory tool.
+
+    An empty query is treated as "show me everything you know", capped - the
+    model asks that when the user says "what do you remember about me?"."""
+    memory = load_memory()
+    words  = [w for w in re.split(r"[^\w]+", (query or "").lower()) if len(w) > 1]
+
+    rows: list[tuple[int, str, str, str]] = []
+    for cat, items in memory.items():
+        if not isinstance(items, dict):
+            continue                     # skip 'sessions', which is a list
+        for key, entry in items.items():
+            val = _entry_value(entry)
+            if not val:
+                continue
+            s = _score(words, cat, key, val) if words else 1
+            if s > 0:
+                rows.append((s, cat, key, val))
+
+    if not rows:
+        return (f"Nothing stored about '{query}'." if query
+                else "I have not stored anything about this person yet.")
+
+    rows.sort(key=lambda r: (-r[0], r[2]))
+    lines = [f"{cat}/{_pretty(key)}: {val}" for _s, cat, key, val in rows[:max(1, limit)]]
+    head  = (f"Stored facts matching '{query}':" if query
+             else "Everything currently stored:")
+    more  = (f"\n(+{len(rows) - len(lines)} more — search with a narrower keyword)"
+             if len(rows) > len(lines) else "")
+    return head + "\n" + "\n".join(lines) + more
+
+
+def all_entries_for_ui() -> list[dict]:
+    """Flat list for the memory panel: what JARVIS knows, and when it learned it.
+    Sorted newest first so the panel opens on what changed most recently."""
+    memory = load_memory()
+    rows = []
+    for cat, items in memory.items():
+        if not isinstance(items, dict):
+            continue
+        for key, entry in items.items():
+            val = _entry_value(entry)
+            if not val:
+                continue
+            rows.append({
+                "category": cat,
+                "key":      key,
+                "value":    val,
+                "updated":  (entry.get("updated", "") if isinstance(entry, dict) else ""),
+            })
+    rows.sort(key=lambda r: (r["updated"] or "0000-00-00"), reverse=True)
+    return rows
 
 def remember(key: str, value: str, category: str = "notes") -> str:
     valid = {"identity", "preferences", "projects", "relationships", "wishes", "notes"}

@@ -1,18 +1,21 @@
 import platform as _platform
 import subprocess as _subprocess
+
+# ── Console encoding ─────────────────────────────────────────────────────────
+# Windows consoles default to a legacy codepage — cp1254 in Turkey, cp1251 in
+# Russia, cp932 in Japan. Printing an emoji there raises UnicodeEncodeError, and
+# several of these prints sit inside except handlers, so the handler itself dies
+# and skips the recovery code after it. Reconfiguring to UTF-8 with a
+# replacement fallback costs nothing and makes the app behave in every locale.
 import sys as _sys
 
-# ── Make stdout/stderr UTF-8 tolerant ────────────────────────────────────────
-# On non-UTF-8 Windows consoles (cp1254/cp1252/cp936...) any print() containing
-# an emoji raises UnicodeEncodeError.  Several of those prints sit inside except
-# handlers, so the handler itself would blow up and skip the recovery code that
-# follows it — turning a recoverable error into a silent hang.  errors="replace"
-# makes every print safe.
-for _stream in (_sys.stdout, _sys.stderr):
+for _stream in ("stdout", "stderr"):
     try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
+        _s = getattr(_sys, _stream, None)
+        if _s is not None and hasattr(_s, "reconfigure"):
+            _s.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
-        pass   # frozen builds may have no real stream attached
+        pass          # pythonw / redirected pipes / anything exotic — never fatal
 
 # ── Nuclear: force CREATE_NO_WINDOW on EVERY subprocess call on Windows ───────
 # This patches Popen itself, so no per-file flag is needed anywhere.
@@ -40,12 +43,14 @@ from datetime import datetime
 from pathlib import Path
 
 import sounddevice as sd
+import numpy as np
 from google import genai
 from google.genai import types
 from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
     save_session_summary, pop_last_session,
+    search_memory, set_trim_notifier,
 )
 
 from actions.file_processor import file_processor
@@ -71,8 +76,13 @@ from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
 from actions.web_search        import _news as _fetch_news_sync
-from memory.config_manager     import get_brief_enabled
+from memory.config_manager     import (
+    get_brief_enabled, get_voice, get_input_device, get_output_device,
+)
 from core.plugin_loader        import discover_plugins
+from core                      import undo as undo_stack
+from core                      import confirm as confirm_gate
+from core                      import audio_devices
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -87,6 +97,28 @@ CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
+
+# RMS below which 16-bit PCM is treated as room silence; above _LEVEL_FULL it
+# reads as a full-height waveform. Tuned so ordinary speech lands mid-range and
+# the bars still move for a quiet talker — language- and device-independent.
+_LEVEL_FLOOR = 60.0
+_LEVEL_FULL  = 2600.0
+
+
+def _pcm_level(samples) -> float:
+    """Map a block of int16 PCM samples to a 0.0–1.0 loudness level for the HUD
+    waveform. Returns 0.0 on empty/invalid input so it can never raise."""
+    try:
+        x = np.asarray(samples, dtype=np.float32)
+        if x.size == 0:
+            return 0.0
+        rms = float(np.sqrt(np.mean(x * x)))
+    except Exception:
+        return 0.0
+    if rms <= _LEVEL_FLOOR:
+        return 0.0
+    return min(1.0, (rms - _LEVEL_FLOOR) / (_LEVEL_FULL - _LEVEL_FLOOR))
+
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -250,14 +282,48 @@ TOOL_DECLARATIONS = [
             "Controls the computer: volume, brightness, window management, keyboard shortcuts, "
             "typing text on screen, closing apps, fullscreen, dark mode, WiFi, restart, shutdown, "
             "scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. "
-            "Use for ANY single computer control command."
+            "Use for ANY single computer control command. "
+            "restart, shutdown and toggle_wifi put a confirmation on the user's screen "
+            "and do NOT happen until they press it — never claim they are done. "
+            "Volume, brightness and dark mode can be reversed with the `undo` tool."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "The action to perform"},
-                "description": {"type": "STRING", "description": "Natural language description of what to do"},
-                "value":       {"type": "STRING", "description": "Optional value: volume level, text to type, etc."}
+                # The exact vocabulary, spelled out.
+                #
+                # This used to say only "The action to perform", so the model
+                # usually filled `description` instead — and computer_settings
+                # then made a SECOND Gemini call, inside the tool, purely to
+                # translate that sentence into one of these names. Every
+                # "turn the volume down" cost two model round trips.
+                "action": {
+                    "type": "STRING",
+                    "description": (
+                        "The exact action. Prefer this over `description` — pick one of: "
+                        "volume_up | volume_down | volume_set | mute | "
+                        "brightness_up | brightness_down | sleep_display | "
+                        "pause_video | close_app | close_window | full_screen | "
+                        "minimize | maximize | snap_left | snap_right | "
+                        "switch_window | show_desktop | task_manager | focus_search | "
+                        "refresh_page | close_tab | new_tab | next_tab | prev_tab | "
+                        "go_back | go_forward | zoom_in | zoom_out | zoom_reset | "
+                        "find_on_page | scroll_up | scroll_down | scroll_top | "
+                        "scroll_bottom | page_up | page_down | copy | paste | cut | "
+                        "undo | redo | select_all | save | enter | escape | press_key | "
+                        "type_text | screenshot | lock_screen | open_settings | "
+                        "file_explorer | open_run | dark_mode | toggle_wifi | "
+                        "restart | shutdown"
+                    ),
+                },
+                "description": {
+                    "type": "STRING",
+                    "description": (
+                        "Fallback only, when no action name above fits. "
+                        "Resolved locally — no extra model call."
+                    ),
+                },
+                "value":       {"type": "STRING", "description": "Optional value: volume level 0-100, text to type, key name, etc."}
             },
             "required": []
         }
@@ -558,7 +624,97 @@ TOOL_DECLARATIONS = [
             "required": ["category", "key", "value"]
         }
     },
+    {
+        "name": "recall_memory",
+        "description": (
+            "Look up a fact you have stored about the user but which is NOT in "
+            "the memory block of your system prompt. "
+            "The prompt lists the keys it did not have room for under "
+            "'[ALSO REMEMBERED]' — if the user asks about anything named there, "
+            "call this FIRST. "
+            "Also call it before saying you do not know something personal, and "
+            "when the user asks what you remember about them (leave query empty "
+            "for everything). "
+            "This is a local file search: it is instant and costs nothing."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": {
+                    "type": "STRING",
+                    "description": (
+                        "Keyword to search for — a name, a topic, a category "
+                        "(e.g. 'ayse', 'coffee', 'projects'). "
+                        "Leave empty to list everything stored."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "undo",
+        "description": (
+            "Reverse the last change YOU made to this computer — a file you "
+            "moved, renamed, created or wrote, or a setting you changed such as "
+            "volume, brightness, dark mode or WiFi. "
+            "Call this whenever the user says undo, revert, take it back, put it "
+            "back, cancel that, or tells you that you did the wrong thing, in ANY "
+            "language. "
+            "Use action='list' when they ask what can be undone. "
+            "This only covers your own actions — it is not the Ctrl+Z of whatever "
+            "application is on screen (that is computer_settings with action 'undo')."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "undo (default) — reverse the last change | list — show what can be undone",
+                },
+            },
+            "required": [],
+        },
+    },
 ]
+
+class _ReconnectSignal(Exception):
+    """Raised inside the session TaskGroup to force a clean, voluntary reconnect
+    (e.g. the user picked a new voice — the voice is fixed at connect time, so
+    the session must be rebuilt).
+
+    Carries `keep_context`: True for an ordinary rebuild, where the stored
+    resumption handle is replayed and the conversation continues; False when the
+    new session must genuinely start clean (see the voice-change note in
+    _on_voice_change)."""
+
+    def __init__(self, keep_context: bool = True):
+        super().__init__()
+        self.keep_context = keep_context
+
+
+def _is_reconnect_signal(exc: BaseException) -> bool:
+    """True if `exc` is a _ReconnectSignal, or a(n) (Base)ExceptionGroup that
+    wraps one — TaskGroup bundles child exceptions into a group."""
+    if isinstance(exc, _ReconnectSignal):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_reconnect_signal(sub) for sub in exc.exceptions)
+    return False
+
+
+def _keep_context_of(exc: BaseException) -> bool:
+    """Read `keep_context` off a reconnect signal, unwrapping the group the
+    TaskGroup put it in. Defaults to True: an unexpected shape must not silently
+    wipe the conversation."""
+    if isinstance(exc, _ReconnectSignal):
+        return getattr(exc, "keep_context", True)
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            if _is_reconnect_signal(sub):
+                return _keep_context_of(sub)
+    return True
+
 
 class JarvisLive:
 
@@ -581,6 +737,26 @@ class JarvisLive:
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_interrupt      = self.interrupt
+        self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
+        self.ui.on_audio_device_change = self._on_audio_device_change
+        self._reconnect_event: asyncio.Event | None = None
+        self._reconnect_keep = True   # False → next rebuild drops the resumption handle
+
+        # ── Session resumption ─────────────────────────────────────────
+        # The server issues a resumption handle every few seconds and reissues
+        # it as the conversation moves on. Before this, session_resumption was
+        # switched ON in the config and the update was never read, so the handle
+        # was thrown away and EVERY reconnect — a dropped packet, a voice change,
+        # switching microphone — started an empty session. "Unlimited sessions"
+        # leaked through exactly this hole.
+        #
+        # Deliberately in RAM only, never written to disk. Persisting it would
+        # make a fresh launch continue yesterday's conversation, which sounds
+        # appealing but breaks the session-summary flow: _save_session_summary
+        # runs at shutdown and the morning briefing pops it the next day. A
+        # conversation that never ends never produces a summary, and the
+        # "yesterday we talked about…" line silently disappears.
+        self._resume_handle: str | None = None
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
         self._briefing_sent    = False          # morning briefing fires once per process
@@ -625,6 +801,53 @@ class JarvisLive:
             asyncio.run_coroutine_threadsafe(_say(), loop)
         except Exception as e:
             print(f"[PluginSay] {e}")
+
+    def request_reconnect(self, keep_context: bool = True, reason: str = ""):
+        """Thread-safe: ask the run loop to tear down and rebuild the Live
+        session. Called from the Qt thread. No-op until the async loop and
+        reconnect event exist.
+
+        `keep_context=False` drops the resumption handle so the new session
+        starts empty — only for changes the server cannot apply to a resumed
+        session."""
+        loop = getattr(self, "_loop", None)
+        ev   = self._reconnect_event
+        self._reconnect_keep   = keep_context
+        self._reconnect_reason = reason
+        if loop and ev is not None:
+            loop.call_soon_threadsafe(ev.set)
+
+    def _on_voice_change(self):
+        """Voice picker applied.
+
+        The voice is baked into the session at connect time, so a rebuild is
+        required. It is rebuilt WITHOUT the resumption handle on purpose:
+        resuming restores the server's own session state, and the safe reading
+        is that it restores the voice with it — which would make the picker
+        appear to do nothing. Losing context here is acceptable because changing
+        voice is a deliberate, rare act; losing it on a dropped packet was not."""
+        self.request_reconnect(keep_context=False, reason="new voice")
+
+    def _on_audio_device_change(self):
+        """Microphone or speaker changed. Both streams are opened inside the
+        session TaskGroup, so they can only be re-opened by rebuilding it —
+        but the conversation is kept, which is the whole reason resumption
+        landed before this feature did."""
+        self.request_reconnect(keep_context=True, reason="audio device")
+
+    async def _watch_reconnect(self):
+        """Session-scoped task: when a voluntary reconnect is requested, raise a
+        signal that unwinds the TaskGroup so the run loop rebuilds the session."""
+        assert self._reconnect_event is not None
+        await self._reconnect_event.wait()
+        self._reconnect_event.clear()
+        keep   = self._reconnect_keep
+        reason = getattr(self, "_reconnect_reason", "") or "settings"
+        self.ui.write_log(
+            f"SYS: Applying {reason} — reconnecting"
+            + ("..." if keep else " (starting a fresh conversation)...")
+        )
+        raise _ReconnectSignal(keep_context=keep)
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -720,8 +943,12 @@ class JarvisLive:
         # Identity injection — overrides any hardcoded name in prompt.txt
         _addr = (f"ADDRESS: Always call the user '{_user_name}'."
                  if _user_name
-                 else "ADDRESS: When speaking Turkish → always say \"efendim\". "
-                      "When speaking English → say \"sir\". Never mix languages.")
+                 else "ADDRESS: Address the user with the ordinary respectful form "
+                      "for a superior in the language you are currently speaking — "
+                      "\"sir\" in English, its everyday equivalent in any other "
+                      "language. Never an archaic or aristocratic form, and never "
+                      "the form from a different language than the one you are "
+                      "speaking in this sentence.")
         identity_ctx = (
             f"[IDENTITY]\n"
             f"Your name is {self._asst_name}. "
@@ -740,7 +967,12 @@ class JarvisLive:
             input_audio_transcription={},
             system_instruction="\n".join(parts),
             tools=[{"function_declarations": TOOL_DECLARATIONS + self._plugin_registry.get_tool_declarations()}],
-            session_resumption=types.SessionResumptionConfig(),
+            # Hand back the handle captured from the last session_resumption
+            # update. `handle=None` is exactly the old behaviour (ask for
+            # handles, start fresh), so the first connect of a run is unchanged.
+            session_resumption=types.SessionResumptionConfig(
+                handle=self._resume_handle
+            ),
             # Sliding-window compression: session never dies from a full context
             # window — JARVIS can stay in one conversation for hours
             context_window_compression=types.ContextWindowCompressionConfig(
@@ -749,7 +981,7 @@ class JarvisLive:
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Charon"
+                        voice_name=get_voice()
                     )
                 )
             ),
@@ -787,7 +1019,23 @@ class JarvisLive:
         result = "Done."
 
         try:
-            if name == "open_app":
+            if name == "recall_memory":
+                # Local file search: no network, no second model. Kept out of
+                # the executor deliberately — it is a dictionary scan over a few
+                # hundred short strings, and a thread hop would cost more than
+                # the work itself.
+                result = search_memory(args.get("query", ""), limit=8)
+
+            elif name == "undo":
+                if str(args.get("action", "")).lower().strip() == "list":
+                    items = undo_stack.history()
+                    result = ("Things I can undo, most recent first:\n"
+                              + "\n".join(f"{i+1}. {t}" for i, t in enumerate(items))
+                              ) if items else "I have not changed anything I can undo yet."
+                else:
+                    result = await loop.run_in_executor(None, undo_stack.undo_last)
+
+            elif name == "open_app":
                 r = await loop.run_in_executor(None, lambda: open_app(parameters=args, response=None, player=self.ui))
                 result = r or f"Opened {args.get('app_name')}."
 
@@ -972,15 +1220,49 @@ class JarvisLive:
                     self.out_queue.put_nowait,
                     {"data": data, "mime_type": "audio/pcm"}
                 )
+                # Feed the live mic level to the HUD so the waveform reacts to
+                # the user's actual voice while listening. Purely cosmetic — any
+                # failure here must never disturb the mic.
+                try:
+                    self.ui.set_audio_level(_pcm_level(indata))
+                except Exception:
+                    pass
 
         try:
-            with sd.InputStream(
-                samplerate=SEND_SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="int16",
-                blocksize=CHUNK_SIZE,
-                callback=callback,
-            ):
+            def _open_mic(dev):
+                return sd.InputStream(
+                    samplerate=SEND_SAMPLE_RATE,
+                    channels=CHANNELS,
+                    dtype="int16",
+                    blocksize=CHUNK_SIZE,
+                    device=dev,
+                    callback=callback,
+                )
+
+            # Which microphone. resolve() returns None for "system default" and
+            # for a saved device that is no longer present — so a headset
+            # unplugged since the last run falls back to the built-in mic
+            # instead of raising on startup and taking the session with it.
+            _mic_name = get_input_device()
+            _mic_dev  = audio_devices.resolve(_mic_name, "input")
+            if _mic_dev is not None:
+                print(f"[JARVIS] 🎤 Input device: {_mic_name}")
+            try:
+                _mic_stream = _open_mic(_mic_dev)
+            except Exception as _e:
+                # A device the picker listed but the driver will not open right
+                # now — exclusive mode, a webcam already in use, a virtual mic
+                # whose source went away. Chosen hardware failing must never
+                # mean the assistant cannot hear at all.
+                if _mic_dev is None:
+                    raise
+                print(f"[JARVIS] ⚠️  Mic '{_mic_name}' failed: {_e} — using default")
+                self.ui.write_log(
+                    f"SYS: Microphone '{_mic_name}' unavailable — using system default."
+                )
+                _mic_stream = _open_mic(None)
+
+            with _mic_stream:
                 print("[JARVIS] 🎤 Mic stream open")
                 while True:
                     await asyncio.sleep(0.1)
@@ -995,6 +1277,19 @@ class JarvisLive:
         try:
             while True:
                 async for response in self.session.receive():
+
+                    # ── Session resumption ───────────────────────────────────
+                    # The server sends this periodically. `resumable` goes false
+                    # while a turn is mid-flight — replaying a handle from that
+                    # moment is what the flag exists to prevent — so only
+                    # resumable handles are kept. This is three lines and it is
+                    # the entire fix for "every reconnect forgets everything".
+                    _sru = getattr(response, "session_resumption_update", None)
+                    if _sru is not None:
+                        if getattr(_sru, "resumable", False) and getattr(_sru, "new_handle", None):
+                            if self._resume_handle is None:
+                                print("[JARVIS] 🔗 Session resumption armed")
+                            self._resume_handle = _sru.new_handle
 
                     if response.data:
                         if self._interrupted:
@@ -1107,13 +1402,33 @@ class JarvisLive:
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
 
-        stream = sd.RawOutputStream(
-            samplerate=RECEIVE_SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=CHUNK_SIZE,
-        )
-        stream.start()
+        _spk_name = get_output_device()
+        _spk_dev  = audio_devices.resolve(_spk_name, "output")
+        if _spk_dev is not None:
+            print(f"[JARVIS] 🔊 Output device: {_spk_name}")
+
+        def _open_spk(dev):
+            st = sd.RawOutputStream(
+                samplerate=RECEIVE_SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=CHUNK_SIZE,
+                device=dev,
+            )
+            st.start()
+            return st
+
+        try:
+            stream = _open_spk(_spk_dev)
+        except Exception as _e:
+            # A chosen output that the host API accepts by name but refuses to
+            # open (exclusive mode, wrong sample rate, device asleep) must not
+            # cost the user their voice. Fall back to the default and say so.
+            if _spk_dev is None:
+                raise
+            print(f"[JARVIS] ⚠️  Output device '{_spk_name}' failed: {_e} — using default")
+            self.ui.write_log(f"SYS: Speaker '{_spk_name}' unavailable — using system default.")
+            stream = _open_spk(None)
 
         try:
             while True:
@@ -1143,6 +1458,13 @@ class JarvisLive:
                         batch.extend(self.audio_in_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
+
+                # Drive the HUD waveform from JARVIS's own voice while speaking.
+                try:
+                    self.ui.set_audio_level(_pcm_level(
+                        np.frombuffer(bytes(batch), dtype=np.int16)))
+                except Exception:
+                    pass
 
                 try:
                     await asyncio.to_thread(stream.write, bytes(batch))
@@ -1187,7 +1509,12 @@ class JarvisLive:
             return
 
         # ── Phase 1: instant greeting ─────────────────────────────────────────
-        lang_clause = f" Respond in {lang}." if lang else ""
+        # The briefing fires before the user has said anything, so the
+        # remembered language is the only signal there is. It is a starting
+        # point, not a setting: the moment they reply, their language wins.
+        lang_clause = (f" Speak this greeting in {lang}, then follow the "
+                       f"user's own language from their first reply onward."
+                       if lang else "")
         name_clause = f" Address the user as {name}." if name else ""
 
         # Inject last session context if available — pop removes it so it's never repeated
@@ -1221,7 +1548,9 @@ class JarvisLive:
         # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
         async def _deliver_news():
             try:
-                lang_str = f" Respond in {lang}." if lang else ""
+                lang_str = (f" Speak in {lang} unless the user has since "
+                            f"spoken another language, in which case use theirs."
+                            if lang else "")
 
                 # Wait for news fetch (already running) and Phase 1 turn-complete
                 # in parallel — whichever takes longer determines the wait time
@@ -1472,6 +1801,27 @@ class JarvisLive:
 
     async def run(self):
         self._loop = asyncio.get_event_loop()
+        self._reconnect_event = asyncio.Event()
+
+        # ── Wire the shared core services to the interface ───────────────────
+        # The confirmation gate is useless without a way to ask, and a memory
+        # trim is invisible without a way to say so. Both are bound once here
+        # rather than passed down through every action signature.
+        confirm_gate.bind(
+            show = self.ui.show_confirm,
+            hide = self.ui.hide_confirm,
+            log  = self.ui.write_log,
+        )
+        set_trim_notifier(self.ui.write_log)
+
+        # Tell the device picker the exact rates the streams open at, from the
+        # constants that actually open them — so it can never list a device that
+        # cannot be opened at them.
+        audio_devices.configure(SEND_SAMPLE_RATE, RECEIVE_SAMPLE_RATE)
+
+        # Enumerate audio devices off-thread. The settings drawer must never pay
+        # for host-API enumeration on the Qt thread.
+        audio_devices.prefetch()
 
         # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
         try:
@@ -1489,6 +1839,7 @@ class JarvisLive:
             try:
                 print("[JARVIS] Connecting...")
                 self.ui.set_state("THINKING")
+                _resumed_with = self._resume_handle is not None
                 config = self._build_config()
 
                 # Fresh client on every reconnect — avoids stale HTTP session state
@@ -1517,12 +1868,19 @@ class JarvisLive:
                     self._interrupted          = False
 
                     print("[JARVIS] Connected.")
+                    if _resumed_with:
+                        # Say it plainly: the difference between "it reconnected"
+                        # and "it reconnected and still knows what we were doing"
+                        # is the whole point, and it is invisible otherwise.
+                        self.ui.write_log("SYS: Reconnected — conversation restored.")
                     self.ui.set_state("LISTENING")
                     self.ui.write_log("SYS: JARVIS online.")
 
                     if self._dashboard:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
 
+                    self._reconnect_event.clear()  # ignore requests from before this session
+                    tg.create_task(self._watch_reconnect())
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
@@ -1548,6 +1906,35 @@ class JarvisLive:
                 # externally, which `except Exception` would miss, letting the
                 # exception escape the while-loop and causing asyncio.run() to
                 # start shutdown — resulting in "executor after shutdown" errors).
+                # Voluntary reconnect (voice change) — not an error. Rebuild the
+                # session immediately with no backoff and no scary logs.
+                if _is_reconnect_signal(e):
+                    print("[JARVIS] Voluntary reconnect requested.")
+                    if not _keep_context_of(e):
+                        # A deliberate clean slate (voice change) — drop the
+                        # handle so the next connect really does start empty.
+                        self._resume_handle = None
+                    self._conn_backoff = 0
+                    continue
+
+                # A resumption handle the server will not accept — expired, or
+                # belonging to a session it has since dropped. Without this, the
+                # same dead handle would be replayed on every retry and the
+                # assistant would never come back at all: the feature meant to
+                # survive a reconnect would be the thing preventing one. Drop it
+                # once and let the next attempt start clean.
+                if _resumed_with and (
+                    "resum" in str(e).lower()
+                    or "handle" in str(e).lower()
+                    or "INVALID_ARGUMENT" in str(e)
+                    or "NOT_FOUND" in str(e)
+                ):
+                    print("[JARVIS] 🔗 Resumption handle rejected — starting a fresh session")
+                    self.ui.write_log("SYS: Could not restore the conversation — starting fresh.")
+                    self._resume_handle = None
+                    self._conn_backoff = 0
+                    continue
+
                 err_str = str(e)
                 print(f"[JARVIS] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()

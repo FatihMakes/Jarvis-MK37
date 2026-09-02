@@ -75,6 +75,35 @@ def save_assistant_config(assistant_name: str, user_name: str) -> None:
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
 
+# ── Assistant voice ──────────────────────────────────────────────────────────
+# Gemini Live prebuilt voices. Names are proper nouns — identical in every
+# language, so this list is safe to show verbatim in any locale.
+AVAILABLE_VOICES = ["Charon", "Puck", "Kore", "Fenrir", "Aoede"]
+DEFAULT_VOICE    = "Charon"
+
+
+def get_voice() -> str:
+    """Return the configured Live voice, falling back to the default if unset
+    or if the stored value is not a voice we recognise."""
+    v = load_api_keys().get("voice_name", DEFAULT_VOICE) or DEFAULT_VOICE
+    return v if v in AVAILABLE_VOICES else DEFAULT_VOICE
+
+
+def save_voice(voice_name: str) -> None:
+    """Persist the chosen Live voice. Unknown names collapse to the default so a
+    bad value can never reach the API and break the session."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    v = (voice_name or "").strip()
+    data["voice_name"] = v if v in AVAILABLE_VOICES else DEFAULT_VOICE
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
 def get_brief_enabled() -> bool:
     return load_api_keys().get("morning_brief_enabled", True)
 
@@ -89,6 +118,48 @@ def save_brief_enabled(enabled: bool) -> None:
             data = {}
     data["morning_brief_enabled"] = enabled
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+# ── Audio devices ────────────────────────────────────────────────────────────
+# Stored as device NAMES, not sounddevice indices. Indices shift every time a
+# USB device is plugged in or removed, so a saved index silently starts pointing
+# at a different microphone. The empty string means "system default", which is
+# both the factory setting and what an unresolvable saved device falls back to —
+# so unplugging a headset degrades to the built-in speakers instead of crashing.
+
+def _patch_config(**fields) -> None:
+    """Read-modify-write one or more keys in api_keys.json.
+
+    Every setter in this file open-coded this. Collapsing it here means a new
+    setting is one line, and there is one place where a corrupt config file is
+    handled instead of nine."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data.update(fields)
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_input_device() -> str:
+    """Microphone device name, or '' for the system default."""
+    return (load_api_keys().get("input_device", "") or "").strip()
+
+
+def save_input_device(name: str) -> None:
+    _patch_config(input_device=(name or "").strip())
+
+
+def get_output_device() -> str:
+    """Speaker device name, or '' for the system default."""
+    return (load_api_keys().get("output_device", "") or "").strip()
+
+
+def save_output_device(name: str) -> None:
+    _patch_config(output_device=(name or "").strip())
 
 
 def get_plugin_enabled(plugin_name: str) -> bool:

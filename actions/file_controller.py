@@ -10,7 +10,85 @@ try:
 except ImportError:
     _SEND2TRASH = False
 
+from core.undo import push_undo
+
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
+
+# Undo keeps a file's previous contents in memory so `write` can be reversed.
+# Above this size it does not — a 200 MB log would sit in RAM for the rest of
+# the session to protect an edit nobody is going to take back.
+_UNDO_CONTENT_LIMIT = 1_000_000
+
+
+def _undo_move(src: Path, dst: Path):
+    """Reverse of a move: put it back where it came from."""
+    def _fn():
+        if not dst.exists():
+            return f"'{dst.name}' is no longer there — nothing moved back."
+        src.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(dst), str(src))
+        return f"'{src.name}' is back in {src.parent.name}/."
+    return _fn
+
+
+def _undo_create(target: Path):
+    """Reverse of a create: remove what we made — and only if we still made it.
+
+    Deliberately refuses to touch a directory that has since been filled: the
+    undo for 'create a folder' is not 'delete whatever ended up in it'."""
+    def _fn():
+        if not target.exists():
+            return f"'{target.name}' is already gone."
+        if target.is_dir():
+            if any(target.iterdir()):
+                return (f"'{target.name}' is not empty any more — "
+                        f"leaving it alone rather than deleting your files.")
+            target.rmdir()
+        else:
+            target.unlink()
+        return f"Removed '{target.name}'."
+    return _fn
+
+
+def _undo_write(target: Path, previous: str | None):
+    """Reverse of a write: restore the old contents, or remove a file that did
+    not exist before the write created it."""
+    def _fn():
+        if previous is None:
+            if target.exists():
+                target.unlink()
+                return f"Removed '{target.name}' — it did not exist before."
+            return f"'{target.name}' is already gone."
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(previous, encoding="utf-8")
+        return f"Restored the previous contents of '{target.name}'."
+    return _fn
+
+
+def _restore_from_trash(original: Path) -> str:
+    """Best-effort undelete.
+
+    delete_file uses send2trash, which is the right call: the file lands in the
+    Recycle Bin / Trash where the person can also find it themselves. Getting it
+    back out again is shell work and only reliable on Windows, where pywin32 is
+    already a dependency. Everywhere else this says where the file is instead of
+    pretending it failed — the file is not lost either way."""
+    if _OS == "Windows":
+        try:
+            import win32com.client
+            shell = win32com.client.Dispatch("Shell.Application")
+            bin_folder = shell.NameSpace(10)      # ssfBITBUCKET
+            for item in bin_folder.Items():
+                if str(bin_folder.GetDetailsOf(item, 1)).strip().lower() == \
+                        str(original.parent).strip().lower():
+                    if str(item.Name).strip().lower() == original.name.strip().lower():
+                        item.InvokeVerb("UNDELETE")
+                        return f"'{original.name}' restored from the Recycle Bin."
+        except Exception as e:
+            print(f"[file] Recycle Bin restore failed: {e}")
+    return (f"'{original.name}' is in the Recycle Bin — I could not pull it back "
+            f"automatically, but it is there and can be restored by hand.")
+
 
 _SAFE_ROOTS: list[Path] = [
     Path.home(),
@@ -85,11 +163,12 @@ def _resolve_path(raw: str) -> Path:
     if lower in shortcuts:
         return shortcuts[lower]
 
-    # "desktop/notlar/a.md" ve "desktop\notlar\a.md" — kisayol + alt yol.
-    # Bu dal olmadan tum dize asagidaki goreli-yol dalina dusuyor ve process'in
-    # CWD'sine gore cozuluyordu.  Proje home disindaysa _is_safe_path reddedip
-    # "Access denied" veriyor; home icindeyse daha kotusu oluyor ve dosya sessizce
-    # projenin icindeki olmayan bir "desktop" klasorune yaziliyordu.
+    # "desktop/notes/a.md" and "desktop\notes\a.md" — a shortcut followed by a
+    # sub-path.  Without this branch the whole string falls through to the
+    # relative-path return below and is resolved against the process CWD instead
+    # of the real Desktop: an "Access denied" when the project lives outside the
+    # home directory, or — worse — a silent write into a stray "desktop" folder
+    # inside the project when it lives inside it.
     head, sep, rest = raw.replace("\\", "/").partition("/")
     if sep and head.lower() in shortcuts:
         rest = rest.strip("/")
@@ -154,7 +233,16 @@ def create_file(path: str, name: str = "", content: str = "") -> str:
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         target.parent.mkdir(parents=True, exist_ok=True)
+        existed = target.exists()
+        previous = None
+        if existed:
+            try:
+                previous = target.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                previous = None
         target.write_text(content, encoding="utf-8")
+        push_undo(f"created {target.name}",
+                  _undo_write(target, previous) if existed else _undo_create(target))
         return f"File created: {target.name}"
     except Exception as e:
         return f"Could not create file: {e}"
@@ -166,7 +254,13 @@ def create_folder(path: str, name: str = "") -> str:
         target = (base / name) if name else base
         if not _is_safe_path(target):
             return f"Access denied: {target}"
+        already = target.exists()
         target.mkdir(parents=True, exist_ok=True)
+        # Only offer to undo a folder we actually made. "mkdir -p" on something
+        # that was already there is not a change, and undoing it would delete a
+        # directory the user has had for years.
+        if not already:
+            push_undo(f"created folder {target.name}", _undo_create(target))
         return f"Folder created: {target.name}"
     except Exception as e:
         return f"Could not create folder: {e}"
@@ -189,7 +283,12 @@ def delete_file(path: str, name: str = "") -> str:
         if target.resolve() in {p.resolve() for p in protected}:
             return f"Protected directory, cannot delete: {target.name}"
 
-        return _safe_trash(target)
+        original = target.resolve()
+        result   = _safe_trash(target)
+        if result.startswith("Moved to Trash"):
+            push_undo(f"deleted {original.name}",
+                      lambda p=original: _restore_from_trash(p))
+        return result
 
     except PermissionError:
         return f"Permission denied: {path}"
@@ -216,7 +315,10 @@ def move_file(path: str, name: str = "", destination: str = "") -> str:
             dst = dst / src.name
 
         dst.parent.mkdir(parents=True, exist_ok=True)
+        origin = src.resolve()
         shutil.move(str(src), str(dst))
+        push_undo(f"moved {origin.name} to {dst.parent.name}/",
+                  _undo_move(origin, dst.resolve()))
         return f"Moved: {src.name} → {dst.parent.name}/"
 
     except Exception as e:
@@ -248,6 +350,18 @@ def copy_file(path: str, name: str = "", destination: str = "") -> str:
         else:
             shutil.copy2(str(src), str(dst))
 
+        # The undo for a copy is deleting the copy — never the original.
+        _copy = dst.resolve()
+        def _undo_copy():
+            if not _copy.exists():
+                return f"The copy '{_copy.name}' is already gone."
+            if _copy.is_dir():
+                shutil.rmtree(_copy)
+            else:
+                _copy.unlink()
+            return f"Removed the copy in {_copy.parent.name}/."
+        push_undo(f"copied {src.name} to {dst.parent.name}/", _undo_copy)
+
         return f"Copied: {src.name} → {dst.parent.name}/"
 
     except Exception as e:
@@ -269,7 +383,10 @@ def rename_file(path: str, name: str = "", new_name: str = "") -> str:
         if new_path.exists():
             return f"A file named '{new_name}' already exists here."
 
+        old_path = target.resolve()
         target.rename(new_path)
+        push_undo(f"renamed {old_path.name} to {new_name}",
+                  _undo_move(old_path, new_path.resolve()))
         return f"Renamed: {target.name} → {new_name}"
 
     except Exception as e:
@@ -304,11 +421,31 @@ def write_file(path: str, name: str = "", content: str = "",
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         target.parent.mkdir(parents=True, exist_ok=True)
+
+        # Snapshot before writing. None means "did not exist", which is a
+        # different undo (delete it) from "existed and had this in it".
+        previous: str | None = None
+        undoable = True
+        if target.exists():
+            try:
+                if target.stat().st_size > _UNDO_CONTENT_LIMIT:
+                    undoable = False       # too large to hold in memory
+                else:
+                    previous = target.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                undoable = False           # binary, locked, unreadable
+
         mode = "a" if append else "w"
         with open(target, mode, encoding="utf-8") as f:
             f.write(content)
+
         action = "Appended to" if append else "Written to"
-        return f"{action}: {target.name}"
+        if undoable:
+            push_undo(f"wrote to {target.name}", _undo_write(target, previous))
+            return f"{action}: {target.name}"
+        return (f"{action}: {target.name}. "
+                f"(Too large to keep a copy of the old contents, so this one "
+                f"cannot be undone.)")
     except Exception as e:
         return f"Could not write file: {e}"
 
@@ -415,6 +552,7 @@ def organize_desktop() -> str:
 
     desktop = _get_desktop()
     moved, skipped = [], []
+    journal: list[tuple[Path, Path]] = []   # (where it was, where it went)
 
     try:
         for item in desktop.iterdir():
@@ -438,8 +576,36 @@ def organize_desktop() -> str:
                 skipped.append(item.name)
                 continue
 
+            origin = item.resolve()
             shutil.move(str(item), str(new_path))
+            journal.append((origin, new_path.resolve()))
             moved.append(f"{item.name} → {target_dir.name}/")
+
+        # One command, dozens of moves — so one undo that reverses all of them.
+        # Without this, "organize my desktop" is the single least reversible
+        # thing the assistant can do to a person's files, and it was completely
+        # ungated.
+        if journal:
+            def _undo_organize(entries=tuple(journal)):
+                restored = 0
+                for origin, moved_to in entries:
+                    try:
+                        if moved_to.exists():
+                            origin.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.move(str(moved_to), str(origin))
+                            restored += 1
+                    except Exception as e:
+                        print(f"[file] undo organize: {moved_to.name}: {e}")
+                # Clear away the folders we created, but only while they are
+                # empty — anything the user put in since stays.
+                for folder in {m.parent for _o, m in entries}:
+                    try:
+                        if folder.exists() and folder.is_dir() and not any(folder.iterdir()):
+                            folder.rmdir()
+                    except Exception:
+                        pass
+                return f"{restored} file(s) put back on the desktop."
+            push_undo(f"organized the desktop ({len(journal)} files)", _undo_organize)
 
         result = f"Desktop organized: {len(moved)} files moved."
         if moved:

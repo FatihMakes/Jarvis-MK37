@@ -28,7 +28,7 @@ from PyQt6.QtGui import (
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
@@ -365,9 +365,31 @@ class HudCanvas(QWidget):
         self._face_px: QPixmap | None = None
         self._load_face(face_path)
 
+        # Live audio reactivity: _live_amp is written from the audio threads
+        # (0.0–1.0), _amp_disp is the smoothed value the paint code reads.
+        self._live_amp  = 0.0
+        self._amp_disp  = 0.0
+        self._base_scale = 1.0    # slow "breathing" target; amp is added per-frame
+        self._base_halo  = 55.0
+
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._tmr.start(16)
+
+    def set_audio_level(self, level: float) -> None:
+        """Thread-safe entry point for the audio threads. Stores the louder of
+        the incoming level and the current value so brief gaps between chunks
+        don't make the waveform stutter; _step() decays it back down."""
+        try:
+            lv = float(level)
+        except (TypeError, ValueError):
+            return
+        if lv < 0.0:
+            lv = 0.0
+        elif lv > 1.0:
+            lv = 1.0
+        if lv > self._live_amp:
+            self._live_amp = lv
 
     def _load_face(self, path: str):
         try:
@@ -389,28 +411,50 @@ class HudCanvas(QWidget):
     def _step(self):
         self._tick += 1
         now = time.time()
+
+        # ── Live audio reactivity ────────────────────────────────────────────
+        # Audio threads push peaks into _live_amp; decay it toward silence so
+        # gaps between chunks fade out instead of freezing, then smooth it.
+        self._live_amp *= 0.86
+        self._amp_disp += (self._live_amp - self._amp_disp) * 0.45
+        amp = self._amp_disp
+
+        # Slow "breathing" base target (random shimmer), refreshed on a timer.
         if now - self._last_t > (0.12 if self.speaking else 0.5):
             if self.speaking:
-                self._tgt_scale = random.uniform(1.06, 1.14)
-                self._tgt_halo  = random.uniform(145, 190)
+                self._base_scale = 1.03
+                self._base_halo  = 122.0
             elif self.muted:
-                self._tgt_scale = random.uniform(0.998, 1.002)
-                self._tgt_halo  = random.uniform(15, 28)
+                self._base_scale = random.uniform(0.998, 1.002)
+                self._base_halo  = random.uniform(15, 28)
             else:
-                self._tgt_scale = random.uniform(1.001, 1.008)
-                self._tgt_halo  = random.uniform(48, 68)
+                self._base_scale = random.uniform(1.001, 1.008)
+                self._base_halo  = random.uniform(48, 68)
             self._last_t = now
 
-        sp = 0.38 if self.speaking else 0.15
+        # Every frame, the live audio level lifts the target on top of the base
+        # — this is what makes the core visibly pulse to the actual voice.
+        if self.muted:
+            self._tgt_scale, self._tgt_halo = self._base_scale, self._base_halo
+        elif self.speaking:
+            self._tgt_scale = self._base_scale + amp * 0.13
+            self._tgt_halo  = self._base_halo  + amp * 95.0
+        else:
+            self._tgt_scale = self._base_scale + amp * 0.06
+            self._tgt_halo  = self._base_halo  + amp * 75.0
+
+        sp = 0.38 if self.speaking else (0.30 if amp > 0.02 else 0.15)
         self._scale += (self._tgt_scale - self._scale) * sp
         self._halo  += (self._tgt_halo  - self._halo)  * sp
 
-        speeds = [1.3, -0.9, 2.0] if self.speaking else [0.55, -0.35, 0.9]
+        # Rings/scanners spin faster while speaking, reacting to loudness.
+        boost  = 1.0 + amp * 1.6
+        speeds = ([1.3, -0.9, 2.0] if self.speaking else [0.55, -0.35, 0.9])
         for i, spd in enumerate(speeds):
-            self._rings[i] = (self._rings[i] + spd) % 360
+            self._rings[i] = (self._rings[i] + spd * boost) % 360
 
-        self._scan  = (self._scan  + (3.0 if self.speaking else 1.3)) % 360
-        self._scan2 = (self._scan2 + (-2.0 if self.speaking else -0.75)) % 360
+        self._scan  = (self._scan  + (3.0 if self.speaking else 1.3) * boost) % 360
+        self._scan2 = (self._scan2 + (-2.0 if self.speaking else -0.75) * boost) % 360
 
         fw  = min(self.width(), self.height())
         lim = fw * 0.74
@@ -441,6 +485,8 @@ class HudCanvas(QWidget):
 
     def paintEvent(self, _):
         p = QPainter(self)
+        if not p.isActive():      # device not ready (e.g. 0-size during layout) — skip cleanly
+            return
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), qcol(C.BG))
 
@@ -581,20 +627,29 @@ class HudCanvas(QWidget):
         p.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
         p.drawText(QRectF(0, sy, W, 26), Qt.AlignmentFlag.AlignCenter, txt)
 
-        # waveform
+        # waveform — reacts to the real audio level (mic while listening,
+        # JARVIS's own voice while speaking). Falls back to a gentle idle
+        # ripple when there's no sound. _amp_disp is the smoothed 0–1 level.
         wy = sy + 30
         N, bw = 36, 8
         wx0 = (W - N * bw) / 2
+        amp = self._amp_disp
+        mid = (N - 1) / 2.0
         for i in range(N):
             if self.muted:
                 hgt, cl = 2, qcol(C.MUTED_C)
-            elif self.speaking:
-                hgt = random.randint(3, 20)
-                cl  = qcol(C.PRI) if hgt > 12 else qcol(C.PRI_DIM)
             else:
-                hgt = int(3 + 2 * math.sin(self._tick * 0.09 + i * 0.6))
-                cl  = qcol(C.BORDER_B)
+                env     = (1.0 - abs(i - mid) / mid) ** 0.7      # center-weighted hump
+                shimmer = 0.55 + 0.45 * math.sin(self._tick * 0.18 + i * 0.7)
+                idle    = 3.0 + 2.0 * math.sin(self._tick * 0.09 + i * 0.6)
+                hgt     = int(max(2, min(24, idle + amp * 22.0 * env * shimmer)))
+                if amp > 0.05:
+                    cl = qcol(C.PRI) if hgt > 12 else qcol(C.PRI_DIM)
+                else:
+                    cl = qcol(C.BORDER_B)
             p.fillRect(QRectF(wx0 + i * bw, wy + 20 - hgt, bw - 1, hgt), cl)
+
+        p.end()   # end deterministically so the backing store never flushes an active painter
 
 class MetricBar(QWidget):
 
@@ -614,6 +669,8 @@ class MetricBar(QWidget):
 
     def paintEvent(self, _):
         p = QPainter(self)
+        if not p.isActive():
+            return
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         W, H = self.width(), self.height()
 
@@ -649,6 +706,8 @@ class MetricBar(QWidget):
         p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
         p.setPen(QPen(bar_col if self._text != "--" else qcol(C.TEXT_DIM), 1))
         p.drawText(QRectF(0, 4, W - 6, 16), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, self._text)
+
+        p.end()
 
 class LogWidget(QTextEdit):
     _sig = pyqtSignal(str)
@@ -857,6 +916,8 @@ class _DropCanvas(QWidget):
 
     def paintEvent(self, _):
         p = QPainter(self)
+        if not p.isActive():
+            return
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         z    = self._z
         W, H = self.width(), self.height()
@@ -880,6 +941,8 @@ class _DropCanvas(QWidget):
         if z._current_file:   self._paint_file(p, W, H)
         elif z._drag_over:    self._paint_drag_over(p, W, H)
         else:                 self._paint_idle(p, W, H, z._hovering)
+
+        p.end()
 
     def _paint_idle(self, p, W, H, hover):
         cx, cy = W / 2, H / 2
@@ -1194,6 +1257,8 @@ class HueWheel(QWidget):
     # ── çizim ────────────────────────────────────────────────────────────────
     def paintEvent(self, _):
         p = QPainter(self)
+        if not p.isActive():
+            return
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect   = self._ring_rect()
         center = rect.center()
@@ -1220,6 +1285,7 @@ class HueWheel(QWidget):
         p.setPen(QPen(QColor("#00060a"), 2))
         p.setBrush(QBrush(QColor("#ffffff")))
         p.drawEllipse(QPointF(hx, hy), 7.5, 7.5)
+        p.end()
 
     # ── fare ─────────────────────────────────────────────────────────────────
     def mousePressEvent(self, e):
@@ -1241,13 +1307,13 @@ class HueWheel(QWidget):
 
 
 class CustomizeOverlay(QWidget):
-    """Floating overlay — change assistant name, user name and UI colour."""
+    """Floating overlay — change assistant name, user name, UI colour and voice."""
 
-    saved = pyqtSignal(str, str, str)   # assistant_name, user_name, ui_color
-    _OW, _OH = 400, 500
+    saved = pyqtSignal(str, str, str, str)   # assistant_name, user_name, ui_color, voice
+    _OW, _OH = 400, 588
 
     def __init__(self, assistant_name="JARVIS", user_name="",
-                 ui_color=DEFAULT_UI_COLOR, parent=None):
+                 ui_color=DEFAULT_UI_COLOR, voice="", parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
@@ -1294,6 +1360,30 @@ class CustomizeOverlay(QWidget):
         self._user_input.setFixedHeight(32)
         self._user_input.setStyleSheet(_fs)
         lay.addWidget(self._user_input)
+
+        # ── Assistant voice — Gemini prebuilt voices ─────────────────────────
+        # Names are language-neutral proper nouns, so the row reads the same in
+        # every locale. Selecting one and applying rebuilds the Live session.
+        from memory.config_manager import AVAILABLE_VOICES, DEFAULT_VOICE
+        lay.addSpacing(4)
+        lay.addWidget(_lbl("ASSISTANT VOICE", 8, color=C.TEXT_DIM,
+                            align=Qt.AlignmentFlag.AlignLeft))
+        self._sel_voice   = (voice or DEFAULT_VOICE)
+        if self._sel_voice not in AVAILABLE_VOICES:
+            self._sel_voice = DEFAULT_VOICE
+        self._voice_btns: dict[str, QPushButton] = {}
+        voice_row = QHBoxLayout(); voice_row.setSpacing(4)
+        for _v in AVAILABLE_VOICES:
+            b = QPushButton(_v)
+            b.setCheckable(True)
+            b.setFixedHeight(28)
+            b.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, name=_v: self._on_voice_pick(name))
+            self._voice_btns[_v] = b
+            voice_row.addWidget(b)
+        lay.addLayout(voice_row)
+        self._refresh_voice_btns()
 
         # ── UI colour — renk çarkı ───────────────────────────────────────────
         lay.addSpacing(4)
@@ -1367,6 +1457,28 @@ class CustomizeOverlay(QWidget):
         btn_row.addWidget(cancel_btn)
         lay.addLayout(btn_row)
 
+    # ── ses seçimi ───────────────────────────────────────────────────────────
+    def _on_voice_pick(self, name: str):
+        self._sel_voice = name
+        self._refresh_voice_btns()
+
+    def _refresh_voice_btns(self):
+        """Highlight the selected voice pill; dim the rest."""
+        for name, b in self._voice_btns.items():
+            on = (name == self._sel_voice)
+            b.setChecked(on)
+            if on:
+                b.setStyleSheet(f"""
+                    QPushButton {{ background: {C.PRI_GHO}; color: {C.PRI};
+                        border: 1px solid {C.PRI}; border-radius: 3px; }}
+                """)
+            else:
+                b.setStyleSheet(f"""
+                    QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                        border: 1px solid {C.BORDER}; border-radius: 3px; }}
+                    QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+                """)
+
     # ── renk akışı ───────────────────────────────────────────────────────────
     def _set_color(self, hx: str, update_wheel: bool = True, preview: bool = True):
         """Seçili rengi günceller; hex kutusu + çark senkron kalır, tema canlı önizlenir."""
@@ -1408,7 +1520,7 @@ class CustomizeOverlay(QWidget):
     def _save(self):
         name = self._name_input.text().strip() or "JARVIS"
         user = self._user_input.text().strip()
-        self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR)
+        self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR, self._sel_voice)
         self.hide()
 
 
@@ -1521,6 +1633,433 @@ class PluginManagerOverlay(QWidget):
         new_val = not get_plugin_enabled(name)
         save_plugin_enabled(name, new_val)
         self._style_toggle(btn, new_val)
+
+
+class _HudOverlay(QWidget):
+    """Base for the floating panels placed by hand over the HUD.
+
+    They are children of the central widget but sit in no layout, so Qt never
+    invalidates the region they occupy when they hide or shrink: the HUD keeps
+    painting around them and their last frame stays on screen as a ghost. Any
+    overlay positioned with _centre_overlay needs this."""
+
+    def hideEvent(self, e):
+        p = self.parentWidget()
+        if p is not None:
+            # Repaint exactly what we were covering, before we stop covering it.
+            p.update(self.geometry())
+        super().hideEvent(e)
+
+    def closeEvent(self, e):
+        p = self.parentWidget()
+        if p is not None:
+            p.update(self.geometry())
+        super().closeEvent(e)
+
+
+class ConfirmBanner(_HudOverlay):
+    """The gate in front of an action that cannot be taken back.
+
+    The old confirmation was a tool parameter the model filled in itself, which
+    means it confirmed its own shutdown requests. This is the interface asking,
+    and the answer travels from a human finger to core/confirm.py without the
+    model in the loop. Nothing blocks while it is up: the assistant keeps
+    talking, so this costs no latency — unlike the old gate, which spent two
+    tool round trips on every power command."""
+
+    answered = pyqtSignal(bool)
+    _OW = 430
+
+    def __init__(self, title: str, detail: str, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            ConfirmBanner {{
+                background: rgba(14, 3, 0, 250);
+                border: 1px solid {C.ACC};
+                border-radius: 6px;
+            }}
+        """)
+        self.setFixedWidth(self._OW)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(8)
+
+        hdr = QLabel("⚠  CONFIRM")
+        hdr.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {C.ACC}; background: transparent;")
+        lay.addWidget(hdr)
+
+        ttl = QLabel(title)
+        ttl.setWordWrap(True)
+        ttl.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        ttl.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        lay.addWidget(ttl)
+
+        if detail:
+            dtl = QLabel(detail)
+            dtl.setWordWrap(True)
+            dtl.setFont(QFont("Courier New", 8))
+            dtl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+            lay.addWidget(dtl)
+
+        row = QHBoxLayout(); row.setSpacing(8)
+
+        yes = QPushButton("▸  CONFIRM")
+        yes.setFixedHeight(32)
+        yes.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        yes.setCursor(Qt.CursorShape.PointingHandCursor)
+        yes.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.ACC};
+                border: 1px solid {C.ACC}; border-radius: 3px; }}
+            QPushButton:hover {{ background: rgba(255,107,0,40); }}
+        """)
+        yes.clicked.connect(lambda: self.answered.emit(True))
+        row.addWidget(yes)
+
+        no = QPushButton("CANCEL")
+        no.setFixedHeight(32)
+        no.setFont(QFont("Courier New", 9))
+        no.setCursor(Qt.CursorShape.PointingHandCursor)
+        no.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        no.clicked.connect(lambda: self.answered.emit(False))
+        row.addWidget(no)
+        lay.addLayout(row)
+
+        # Default focus on CANCEL: if someone hits Enter without reading, the
+        # safe answer wins.
+        no.setDefault(True)
+        no.setFocus()
+
+
+class AudioDeviceOverlay(_HudOverlay):
+    """Choose which microphone JARVIS listens to and which speakers it uses.
+
+    Both audio streams used to open with no `device=` at all, so they always
+    took the OS default — which on Windows moves by itself the moment a headset
+    is plugged in. 'JARVIS can't hear me' is usually 'JARVIS is listening to the
+    webcam'."""
+
+    picked = pyqtSignal()      # emitted after Apply, when something changed
+    _OW = 460
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from core.audio_devices import list_devices, DEFAULT_LABEL
+        from memory.config_manager import get_input_device, get_output_device
+
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            AudioDeviceOverlay {{
+                background: rgba(0, 6, 10, 245);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        self.setFixedWidth(self._OW)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(6)
+
+        hdr = QLabel("🎧  AUDIO DEVICES")
+        hdr.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        lay.addWidget(hdr)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
+        lay.addWidget(sep)
+
+        _combo_css = (
+            f"QComboBox {{ background: #000d12; color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px; }}"
+            f"QComboBox:hover {{ border-color: {C.BORDER_B}; }}"
+            f"QComboBox QAbstractItemView {{ background: #000d12; color: {C.TEXT}; "
+            f"selection-background-color: {C.PRI_GHO}; border: 1px solid {C.BORDER}; }}"
+        )
+
+        def _row(label: str, kind: str, current: str) -> QComboBox:
+            cap = QLabel(label)
+            cap.setFont(QFont("Courier New", 8))
+            cap.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+            lay.addWidget(cap)
+
+            box = QComboBox()
+            box.setFont(QFont("Courier New", 9))
+            box.setFixedHeight(30)
+            box.setStyleSheet(_combo_css)
+            # The list is served from a cache warmed on a background thread at
+            # startup, so opening this panel never blocks the Qt thread on the
+            # host audio API.
+            box.addItem(DEFAULT_LABEL, "")
+            for name in list_devices(kind):
+                box.addItem(name, name)
+            idx = box.findData(current) if current else 0
+            box.setCurrentIndex(idx if idx >= 0 else 0)
+            if current and idx < 0:
+                # Saved device is not plugged in right now. Show it rather than
+                # silently resetting the user's choice to default.
+                box.addItem(f"{current}  (not connected)", current)
+                box.setCurrentIndex(box.count() - 1)
+            lay.addWidget(box)
+            return box
+
+        self._in_box  = _row("MICROPHONE — what JARVIS hears you with",
+                             "input", get_input_device())
+        lay.addSpacing(4)
+        self._out_box = _row("SPEAKERS — what JARVIS talks through",
+                             "output", get_output_device())
+
+        note = QLabel("Applying reconnects the session. Your conversation is kept.")
+        note.setWordWrap(True)
+        note.setFont(QFont("Courier New", 7))
+        note.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        lay.addSpacing(6)
+        lay.addWidget(note)
+
+        row = QHBoxLayout(); row.setSpacing(8)
+        ok = QPushButton("▸  APPLY")
+        ok.setFixedHeight(32)
+        ok.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        ok.setCursor(Qt.CursorShape.PointingHandCursor)
+        ok.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.PRI};
+                border: 1px solid {C.PRI_DIM}; border-radius: 3px; }}
+            QPushButton:hover {{ background: {C.PRI_GHO}; border-color: {C.PRI}; }}
+        """)
+        ok.clicked.connect(self._apply)
+        row.addWidget(ok)
+
+        cancel = QPushButton("CLOSE")
+        cancel.setFixedHeight(32)
+        cancel.setFont(QFont("Courier New", 9))
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        cancel.clicked.connect(self.hide)
+        row.addWidget(cancel)
+        lay.addLayout(row)
+
+    def _apply(self):
+        from memory.config_manager import (
+            get_input_device, get_output_device,
+            save_input_device, save_output_device,
+        )
+        new_in  = self._in_box.currentData()  or ""
+        new_out = self._out_box.currentData() or ""
+        changed = (new_in != get_input_device()) or (new_out != get_output_device())
+        save_input_device(new_in)
+        save_output_device(new_out)
+        self.hide()
+        # Only rebuild the session if something actually moved — a no-op Apply
+        # should not cost a reconnect.
+        if changed:
+            self.picked.emit()
+
+
+class MemoryOverlay(_HudOverlay):
+    """Everything JARVIS has stored about you, and when it learned it.
+
+    Memory used to be a 2200-character store that deleted its oldest entries
+    when full and mentioned it only on stdout. The cap is gone; this panel is
+    the other half of that change — a memory you cannot inspect is a memory you
+    cannot trust, and 'delete' has to be something the person can do."""
+
+    _OW = 520
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            MemoryOverlay {{
+                background: rgba(0, 6, 10, 246);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        self.setFixedWidth(self._OW)
+
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(20, 16, 20, 16)
+        self._lay.setSpacing(5)
+        self._rebuild()
+
+    def _clear_layout(self):
+        """Take every item out of the layout and detach it from the widget tree
+        in this call.
+
+        deleteLater() on its own is not enough: it queues destruction for the
+        next event-loop pass, and until then the old rows are still children of
+        this widget and still paint — which is what drew half of the previous
+        panel over the new one. setParent(None) removes them from the tree now;
+        deleteLater() then frees them safely."""
+        while self._lay.count():
+            item = self._lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                # hide() stops it painting in this frame; deleteLater() frees it
+                # safely afterwards. setParent(None) would also stop the paint,
+                # but it turns the widget into a top-level window for the moment
+                # between the two calls, which is not something to leave lying
+                # around inside a click handler.
+                w.hide()
+                w.deleteLater()
+                continue
+            sub = item.layout()
+            if sub is not None:
+                while sub.count():
+                    si = sub.takeAt(0)
+                    sw = si.widget()
+                    if sw is not None:
+                        sw.hide()
+                        sw.deleteLater()
+                sub.deleteLater()
+
+    def _settle(self, before):
+        """Size the panel to its content, re-centre it, and repaint what the old
+        size covered.
+
+        The re-size has to happen here rather than at the end of _rebuild
+        because Qt has not polished the freshly-created children at that point,
+        so the size hint it would read is the empty-layout one. Measured: a
+        first adjustSize() returned 32 px for a panel whose content needed 155,
+        and a second call — after the same widgets had been through the event
+        loop — returned 155. So this runs twice: once now, once on the next
+        turn, from _rebuild.
+
+        The re-centre and the repaint are needed because the overlay is placed
+        by hand and is in no layout: shrinking it leaves it off-centre and
+        leaves its former pixels on screen, since nothing tells the parent that
+        region changed. The repaint has to cover the union of the old and new
+        rectangles."""
+        self._lay.invalidate()
+        self._lay.activate()
+        self.updateGeometry()
+        self.adjustSize()
+
+        p = self.parentWidget()
+        if p is None:
+            self.update()
+            return
+        self.move(max(0, (p.width()  - self.width())  // 2),
+                  max(0, (p.height() - self.height()) // 2))
+        p.update(before.united(self.geometry()))
+        self.update()
+
+    def _rebuild(self):
+        before = self.geometry()
+        self._clear_layout()
+
+        from memory.memory_manager import all_entries_for_ui
+
+        hdr = QLabel("🧠  WHAT JARVIS REMEMBERS")
+        hdr.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        self._lay.addWidget(hdr)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
+        self._lay.addWidget(sep)
+
+        rows = all_entries_for_ui()
+
+        cap = QLabel(f"{len(rows)} stored facts — newest first. "
+                     f"Nothing here is sent anywhere; it lives in "
+                     f"memory/long_term.json on this machine.")
+        cap.setWordWrap(True)
+        cap.setFont(QFont("Courier New", 7))
+        cap.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        self._lay.addWidget(cap)
+
+        if not rows:
+            empty = QLabel("Nothing stored yet.")
+            empty.setFont(QFont("Courier New", 9))
+            empty.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+            self._lay.addWidget(empty)
+        else:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFixedHeight(min(420, 34 * len(rows) + 10))
+            scroll.setStyleSheet(
+                f"QScrollArea {{ border: 1px solid {C.BORDER}; border-radius: 3px; "
+                f"background: transparent; }}"
+            )
+            inner = QWidget()
+            ilay  = QVBoxLayout(inner)
+            ilay.setContentsMargins(6, 6, 6, 6)
+            ilay.setSpacing(3)
+
+            for r in rows:
+                line = QHBoxLayout(); line.setSpacing(6)
+                txt = QLabel(f"<b>{r['key'].replace('_', ' ')}</b> "
+                             f"<span style='color:{C.TEXT_MED}'>— {r['value']}</span>")
+                txt.setWordWrap(True)
+                txt.setFont(QFont("Courier New", 8))
+                txt.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+                line.addWidget(txt, 1)
+
+                meta = QLabel(f"{r['category'][:4]} · {r['updated'] or '—'}")
+                meta.setFont(QFont("Courier New", 7))
+                meta.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+                line.addWidget(meta)
+
+                rm = QPushButton("✕")
+                rm.setFixedSize(20, 20)
+                rm.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+                rm.setCursor(Qt.CursorShape.PointingHandCursor)
+                rm.setToolTip("Forget this")
+                rm.setStyleSheet(f"""
+                    QPushButton {{ background: transparent; color: {C.TEXT_DIM};
+                        border: 1px solid {C.BORDER}; border-radius: 3px; }}
+                    QPushButton:hover {{ color: {C.RED}; border-color: {C.RED}; }}
+                """)
+                rm.clicked.connect(
+                    lambda _=False, c=r["category"], k=r["key"]: self._forget(c, k))
+                line.addWidget(rm)
+
+                holder = QWidget()
+                holder.setLayout(line)
+                ilay.addWidget(holder)
+
+            ilay.addStretch()
+            scroll.setWidget(inner)
+            self._lay.addWidget(scroll)
+
+        close = QPushButton("CLOSE")
+        close.setFixedHeight(30)
+        close.setFont(QFont("Courier New", 9))
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        close.clicked.connect(self.hide)
+        self._lay.addWidget(close)
+
+        self._settle(before)
+        # …and again once Qt has polished the new children, because the size
+        # hint is not final until then. Harmless when the first pass already
+        # got it right: _settle is idempotent.
+        QTimer.singleShot(0, lambda g=before: self._settle(g))
+
+    def _forget(self, category: str, key: str):
+        from memory.memory_manager import forget
+        forget(key, category)
+        # Rebuild on the NEXT event-loop turn, not inside this click handler.
+        # The rebuild destroys the very ✕ button that emitted this signal, and
+        # Qt is entitled to touch the sender after a slot returns; tearing it
+        # down mid-emission is how a widget ends up half-alive on screen.
+        QTimer.singleShot(0, self._rebuild)
 
 
 class ClipboardPanel(QWidget):
@@ -1846,6 +2385,8 @@ class MainWindow(QMainWindow):
     _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
     _cam_frame_sig  = pyqtSignal(bytes)      # live camera frame → HUD area
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
+    _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
+    _confirm_hide_sig = pyqtSignal()
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -1861,7 +2402,7 @@ class MainWindow(QMainWindow):
         if _ui_color and _ui_color.lower() != DEFAULT_UI_COLOR:
             apply_ui_accent(_ui_color)
 
-        self.setWindowTitle(f"{_display} — MARK LI")
+        self.setWindowTitle(f"{_display} — MARK LII")
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
 
@@ -1874,6 +2415,9 @@ class MainWindow(QMainWindow):
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
         self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
+        self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
+        self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
+        self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self._muted            = False
         self._current_file: str | None = None
@@ -1985,6 +2529,8 @@ class MainWindow(QMainWindow):
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
         self._camera_sig.connect(self._show_camera_frame)
+        self._confirm_sig.connect(self._show_confirm_banner)
+        self._confirm_hide_sig.connect(self._hide_confirm_banner)
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
         self._clipboard_sig.connect(self._show_clipboard_panel)
@@ -2539,7 +3085,7 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {color}; background: transparent;")
             return l
 
-        lay.addWidget(_badge("MARK LI", C.PRI_DIM))
+        lay.addWidget(_badge("MARK LII", C.PRI_DIM))
         lay.addSpacing(8)
         self._drawer_btn = QPushButton("⚙")
         self._drawer_btn.setFixedSize(26, 26)
@@ -2821,6 +3367,22 @@ class MainWindow(QMainWindow):
         self._brief_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._brief_btn.clicked.connect(self._toggle_brief)
         lay.addWidget(self._brief_btn)
+
+        audio_btn = QPushButton("🎧  AUDIO DEVICES")
+        audio_btn.setFixedHeight(26)
+        audio_btn.setFont(QFont("Courier New", 7))
+        audio_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        audio_btn.setStyleSheet(_BTN_STYLE_DIM)
+        audio_btn.clicked.connect(self._open_audio_devices)
+        lay.addWidget(audio_btn)
+
+        mem_btn = QPushButton("🧠  MEMORY")
+        mem_btn.setFixedHeight(26)
+        mem_btn.setFont(QFont("Courier New", 7))
+        mem_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        mem_btn.setStyleSheet(_BTN_STYLE_DIM)
+        mem_btn.clicked.connect(self._open_memory_panel)
+        lay.addWidget(mem_btn)
 
         plugin_btn = QPushButton("🧩  PLUGINS")
         plugin_btn.setFixedHeight(26)
@@ -3195,6 +3757,7 @@ class MainWindow(QMainWindow):
             cfg.get("assistant_name", "JARVIS") or "JARVIS",
             cfg.get("user_name", ""),
             cfg.get("ui_color", "") or DEFAULT_UI_COLOR,
+            cfg.get("voice_name", ""),
             parent=cw,
         )
         ow, oh = CustomizeOverlay._OW, CustomizeOverlay._OH
@@ -3215,11 +3778,12 @@ class MainWindow(QMainWindow):
         if apply_ui_accent(hex_color):
             retheme_all_widgets(old, current_palette())
 
-    def _apply_name_update(self, name: str, user_name: str, ui_color: str = ""):
+    def _apply_name_update(self, name: str, user_name: str, ui_color: str = "",
+                           voice: str = ""):
         """Update all name/theme-dependent UI elements and persist to config."""
         self._assistant_name = name.strip() or "JARVIS"
         display = self._assistant_name.upper()
-        self.setWindowTitle(f"{display} — MARK LI")
+        self.setWindowTitle(f"{display} — MARK LII")
         self._title_lbl.setText(display)
         if display in ("JARVIS", "J.A.R.V.I.S"):
             self._sub_lbl.setText("Just A Rather Very Intelligent System")
@@ -3236,6 +3800,15 @@ class MainWindow(QMainWindow):
                 retheme_all_widgets(old, current_palette())
                 color_changed = old["PRI"] != C.PRI
 
+        # Voice change → persist and, if it actually changed, rebuild the Live
+        # session so the new voice takes effect (it's fixed at connect time).
+        voice_changed = False
+        if voice:
+            from memory.config_manager import get_voice, save_voice
+            if voice != get_voice():
+                save_voice(voice)
+                voice_changed = True
+
         try:
             data = _read_full_config()
             data["assistant_name"] = self._assistant_name
@@ -3246,8 +3819,72 @@ class MainWindow(QMainWindow):
             self._log.append_log(f"SYS: Identity updated — {display}")
             if color_changed:
                 self._log.append_log(f"SYS: UI colour applied — {ui_color}")
+            if voice_changed:
+                self._log.append_log(f"SYS: Voice set — {voice}")
         except Exception as e:
             self._log.append_log(f"ERR: Config save failed — {e}")
+
+        if voice_changed and self.on_voice_change:
+            self.on_voice_change()
+
+    def _centre_overlay(self, ov) -> None:
+        """Place a floating overlay in the middle of the HUD and show it."""
+        cw = self.centralWidget()
+        ov.adjustSize()
+        ov.setGeometry(
+            max(0, (cw.width()  - ov.width())  // 2),
+            max(0, (cw.height() - ov.height()) // 2),
+            ov.width(), ov.height(),
+        )
+        ov.show()
+        ov.raise_()
+
+    # ── Audio devices ────────────────────────────────────────────────────────
+
+    def _open_audio_devices(self):
+        ov = AudioDeviceOverlay(parent=self.centralWidget())
+        ov.picked.connect(self._on_audio_devices_applied)
+        self._centre_overlay(ov)
+        self._audio_overlay = ov            # keep a reference so it isn't GC'd
+
+    def _on_audio_devices_applied(self):
+        self._log.append_log("SYS: Audio devices updated.")
+        if self.on_audio_device_change:
+            self.on_audio_device_change()
+
+    # ── Memory panel ─────────────────────────────────────────────────────────
+
+    def _open_memory_panel(self):
+        ov = MemoryOverlay(parent=self.centralWidget())
+        self._centre_overlay(ov)
+        self._memory_overlay = ov
+
+    # ── Irreversible-action confirmation ─────────────────────────────────────
+
+    def _show_confirm_banner(self, title: str, detail: str):
+        self._hide_confirm_banner()
+        ov = ConfirmBanner(title, detail, parent=self.centralWidget())
+        ov.answered.connect(self._on_confirm_answered)
+        self._centre_overlay(ov)
+        self._confirm_overlay = ov
+
+    def _hide_confirm_banner(self):
+        ov = getattr(self, "_confirm_overlay", None)
+        if ov is not None:
+            ov.hide()
+            ov.deleteLater()
+            self._confirm_overlay = None
+
+    def _on_confirm_answered(self, accepted: bool):
+        # Tear the banner down first: core.confirm.resolve() may be about to
+        # shut the machine down, and a live widget mid-callback is not where you
+        # want to be when that happens.
+        self._hide_confirm_banner()
+        try:
+            from core.confirm import resolve
+            resolve(bool(accepted))
+        except Exception as e:
+            self._log.append_log(f"ERR: Confirmation failed — {e}")
 
     def _open_plugin_manager(self):
         plugins = self.get_plugins() if self.get_plugins else []
@@ -3428,12 +4065,46 @@ class JarvisUI:
         self._win.on_interrupt = cb
 
     @property
+    def on_voice_change(self):
+        return self._win.on_voice_change
+
+    @on_voice_change.setter
+    def on_voice_change(self, cb):
+        self._win.on_voice_change = cb
+
+    @property
+    def on_audio_device_change(self):
+        return self._win.on_audio_device_change
+
+    @on_audio_device_change.setter
+    def on_audio_device_change(self, cb):
+        self._win.on_audio_device_change = cb
+
+    def show_confirm(self, title: str, detail: str) -> None:
+        """Thread-safe: raise the irreversible-action gate. Called from action
+        handlers running in executor threads, so it goes through a signal."""
+        self._win._confirm_sig.emit(str(title)[:120], str(detail)[:300])
+
+    def hide_confirm(self) -> None:
+        """Thread-safe: take the gate down."""
+        self._win._confirm_hide_sig.emit()
+
+    @property
     def get_plugins(self):
         return self._win.get_plugins
 
     @get_plugins.setter
     def get_plugins(self, cb):
         self._win.get_plugins = cb
+
+    def set_audio_level(self, level: float) -> None:
+        """Thread-safe: feed a 0.0–1.0 live audio level to the HUD waveform.
+        Called from the audio threads; a plain float store is atomic under the
+        GIL, so no signal/lock is needed for this cosmetic value."""
+        try:
+            self._win.hud.set_audio_level(level)
+        except Exception:
+            pass
 
     def notify_phone_connected(self) -> None:
         self._win.notify_phone_connected()
